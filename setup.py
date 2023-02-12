@@ -18,11 +18,11 @@ from setuptools import setup
 
 setup(
     name='alphafold-colabfold',
-    version='2.3.2',
+    version='2.3.3',
     long_description_content_type='text/markdown',
-    description='An implementation of the inference pipeline of AlphaFold v2.0.'
+    description='An implementation of the inference pipeline of AlphaFold v2.3.1. '
     'This is a completely new model that was entered as AlphaFold2 in CASP14 '
-    'and published in Nature. This package contains patches for colabfold',
+    'and published in Nature. This package contains patches for colabfold.',
     author='DeepMind',
     author_email='alphafold@deepmind.com',
     license='Apache License, Version 2.0',
