@@ -141,7 +141,8 @@ class AlphaFoldIteration_noE(hk.Module):
           'structure_module': functools.partial(folding.StructureModule, compute_loss=False),
           'predicted_lddt': PredictedLDDTHead,
           'predicted_aligned_error': PredictedAlignedErrorHead,
-          'experimentally_resolved': ExperimentallyResolvedHead} 
+          'experimentally_resolved': ExperimentallyResolvedHead
+    } 
 
     heads = {}
     for name, head_config in sorted(self.config.heads.items()):
@@ -178,8 +179,8 @@ class AlphaFold_noE(hk.Module):
     def get_prev(ret):
       new_prev = {
           'prev_msa_first_row': ret['representations']['msa_first_row'],
-          'prev_pair': ret['representations']['pair'],
-          'prev_pos': ret['structure_module']['final_atom_positions']
+          'prev_pair':          ret['representations']['pair'],
+          'prev_pos':           ret['structure_module']['final_atom_positions']
       }
       return new_prev    
 
@@ -188,11 +189,12 @@ class AlphaFold_noE(hk.Module):
       batch = jax.tree_map(lambda x:x[0], batch)
     if prev is None:
       L = batch["aatype"].shape[0]
-      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
-              'prev_pair': jnp.zeros([L,L,128]),
-              'prev_pos': jnp.zeros([L,37,3])}
+      dtype = jnp.bfloat16 if self.global_config.bfloat16 else jnp.float32
+      prev = {'prev_msa_first_row': jnp.zeros([L,256],  dtype=dtype),
+              'prev_pair':          jnp.zeros([L,L,128],dtype=dtype),
+              'prev_pos':           jnp.zeros([L,37,3])}
     ret = impl(batch={**batch, **prev}, is_training=is_training)
-    ret["prev"] = get_prev(ret) 
+    ret["prev"] = get_prev(ret)
     if not return_representations:
       del ret["representations"]
     return ret
@@ -420,12 +422,13 @@ class AlphaFold(hk.Module):
           ensemble_representations=ensemble_representations)
 
     emb_config = self.config.embeddings_and_evoformer
-    prev = batch.pop("prev",None)
+    prev = batch.pop("prev", None)
     if prev is None:
       L = num_residues
-      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
-              'prev_pair': jnp.zeros([L,L,128]),
-              'prev_pos': jnp.zeros([L,37,3])}
+      dtype = jnp.bfloat16 if self.global_config.bfloat16 else jnp.float32
+      prev = {'prev_msa_first_row': jnp.zeros([L,256],  dtype=dtype),
+              'prev_pair':          jnp.zeros([L,L,128],dtype=dtype),
+              'prev_pos':           jnp.zeros([L,37,3])}
 
     ret = do_call(prev=prev, recycle_idx=0)
     ret["prev"] = get_prev(ret)
@@ -1497,8 +1500,7 @@ class DistogramHead(hk.Module):
     half_logits = common_modules.Linear(
         self.config.num_bins,
         initializer=utils.final_init(self.global_config),
-        name='half_logits')(
-            representations['pair'])
+        name='half_logits')(representations['pair'])
 
     logits = half_logits + jnp.swapaxes(half_logits, -2, -3)
     breaks = jnp.linspace(self.config.first_break, self.config.last_break,
