@@ -198,14 +198,17 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-    z = lambda x:np.zeros(x,dtype=np.float32)
-    prev = {'prev_msa_first_row':z([L,256]),'prev_pair':z([L,L,128]),'prev_pos':z([L,37,3])}
+    def z(shape, dtype=np.float32): return np.zeros(shape, dtype=dtype)
+    dtype = jnp.bfloat16 if self.config.model.global_config.bfloat16 else np.float32
+    prev = {'prev_msa_first_row': z([L,256], dtype),
+            'prev_pair':          z([L,L,128], dtype),
+            'prev_pos':           z([L,37,3])}
     
     def run(key, feat, prev):
-      result = jax.tree_map(lambda x:np.asarray(x),
+      outputs = jax.tree_map(lambda x:np.asarray(x),
                             self.apply(self.params, key, {**feat, "prev":prev}))
-      prev = result.pop("prev")
-      return result, prev
+      prev = outputs.pop("prev")
+      return outputs, prev
 
     # initialize random key
     key = jax.random.PRNGKey(random_seed)
@@ -216,11 +219,11 @@ class RunModel:
       
         # grab subset of features
         if self.multimer_mode:
-            sub_feat = feat
+          sub_feat = feat
         else:
-            s = r * num_ensemble
-            e = (r+1) * num_ensemble
-            sub_feat = jax.tree_map(lambda x:x[s:e], feat)
+          s = r * num_ensemble
+          e = (r+1) * num_ensemble
+          sub_feat = jax.tree_map(lambda x:x[s:e], feat)
             
         # run
         key, sub_key = jax.random.split(key)
@@ -231,7 +234,8 @@ class RunModel:
         confidences = get_confidence_metrics(result, mask=seq_mask, rank_by=self.config.model.rank_by)
         if return_representations:
           result["pae"] = result.pop("predicted_aligned_error")
-          result["representations"] = {"pair": prev["prev_pair"], "single": prev["prev_msa_first_row"]}
+          result["representations"] = {"pair":   prev["prev_pair"].astype(np.float32),
+                                       "single": prev["prev_msa_first_row"].astype(np.float32)}
         result.update(confidences)
 
         # decide when to stop
