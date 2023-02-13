@@ -22,7 +22,6 @@ NUM_MSA_SEQ = shape_placeholders.NUM_MSA_SEQ
 NUM_EXTRA_SEQ = shape_placeholders.NUM_EXTRA_SEQ
 NUM_TEMPLATES = shape_placeholders.NUM_TEMPLATES
 
-
 def model_config(name: str) -> ml_collections.ConfigDict:
   """Get the ConfigDict of a CASP14 model."""
 

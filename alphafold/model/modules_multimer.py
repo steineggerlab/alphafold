@@ -23,7 +23,7 @@ Lower-level modules up to EvoformerIteration are reused from modules.py.
 import functools
 from typing import Sequence
 
-from alphafold.common import residue_constants
+from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom_multimer
 from alphafold.model import common_modules
 from alphafold.model import folding_multimer
@@ -442,12 +442,36 @@ class AlphaFold(hk.Module):
           batch=recycled_batch,
           is_training=is_training,
           safe_key=safe_key)
-        
-    ret = apply_network(prev=batch.pop("prev"), safe_key=safe_key)
+    
+    # initialize
+    prev = batch.pop("prev", None)    
+    if prev is None:
+      L = num_residues
+      prev = {'prev_msa_first_row': jnp.zeros([L,256]),
+              'prev_pair':          jnp.zeros([L,L,128]),
+              'prev_pos':           jnp.zeros([L,37,3])}
+    else:
+      for k,v in prev.items():
+        if v.dtype == jnp.float16:
+          prev[k] = v.astype(jnp.float32)
+
+    ret = apply_network(prev=prev, safe_key=safe_key)
     ret["prev"] = get_prev(ret)
     
     if not return_representations:
       del ret['representations']
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+    ret["tol"] = confidence.compute_tol(
+      prev["prev_pos"], 
+      ret["prev"]["prev_pos"],
+      batch["seq_mask"], 
+      use_jnp=True)
     return ret
 
 class EmbeddingsAndEvoformer(hk.Module):

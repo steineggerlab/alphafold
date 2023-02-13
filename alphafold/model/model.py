@@ -29,56 +29,6 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 import tree
 
-def get_confidence_metrics(
-    prediction_result: Mapping[str, Any],
-    mask: Any,
-    rank_by: str = "auto") -> Mapping[str, Any]:
-  """Post processes prediction_result to get confidence metrics."""  
-  confidence_metrics = {}
-
-  plddt = confidence.compute_plddt(prediction_result['predicted_lddt']['logits'])
-  confidence_metrics['plddt'] = plddt  
-  confidence_metrics["mean_plddt"] = (plddt * mask).sum()/mask.sum()
-
-  if 'predicted_aligned_error' in prediction_result:
-    confidence_metrics.update(confidence.compute_predicted_aligned_error(
-        logits=prediction_result['predicted_aligned_error']['logits'],
-        breaks=prediction_result['predicted_aligned_error']['breaks']))
-    
-    confidence_metrics['ptm'] = confidence.predicted_tm_score(
-        logits=prediction_result['predicted_aligned_error']['logits'],
-        breaks=prediction_result['predicted_aligned_error']['breaks'],
-        residue_weights=mask)    
-
-    asym_id = prediction_result["predicted_aligned_error"].get("asym_id",None)
-    if asym_id is not None and np.unique(asym_id).shape[0] > 1:
-      # Compute the ipTM only for the multimer model.
-      confidence_metrics['iptm'] = confidence.predicted_tm_score(
-          logits=prediction_result['predicted_aligned_error']['logits'],
-          breaks=prediction_result['predicted_aligned_error']['breaks'],
-          residue_weights=mask, asym_id=asym_id)
-
-  # decide what metric to use for the mean_score
-  if rank_by == "auto":
-    if  "iptm" in confidence_metrics:
-      rank_by = "multimer"
-    elif "ptm" in confidence_metrics:
-      rank_by = "ptm"
-    else:
-      rank_by = "plddt"
-  else:
-    if rank_by in ["multimer","iptm"] and "iptm" not in confidence_metrics: rank_by = "ptm"
-    if rank_by == "ptm" and "ptm" not in confidence_metrics: rank_by = "plddt"
-
-  # compute mean_score
-  if rank_by == "multimer": mean_score = 80 * confidence_metrics["iptm"] + 20 * confidence_metrics["ptm"]
-  if rank_by == "iptm":     mean_score = 100 * confidence_metrics["iptm"]
-  if rank_by == "ptm":      mean_score = 100 * confidence_metrics["ptm"]
-  if rank_by == "plddt":    mean_score = confidence_metrics["mean_plddt"]
-  confidence_metrics["ranking_confidence"] = mean_score
-  
-  return confidence_metrics
-
 class RunModel:
   """Container for JAX model."""
 
@@ -198,12 +148,20 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-    z = lambda x:np.zeros(x,dtype=np.float32)
-    prev = {'prev_msa_first_row':z([L,256]),'prev_pair':z([L,L,128]),'prev_pos':z([L,37,3])}
+    zeros = lambda shape: np.zeros(shape, dtype=np.float16)
+    prev = {'prev_msa_first_row': zeros([L,256]),
+            'prev_pair':          zeros([L,L,128]),
+            'prev_pos':           zeros([L,37,3])}
     
     def run(key, feat, prev):
-      result = jax.tree_map(lambda x:np.asarray(x),
-                            self.apply(self.params, key, {**feat, "prev":prev}))
+      def _jnp_to_np(x):
+        for k, v in x.items():
+          if isinstance(v, dict):
+            x[k] = _jnp_to_np(v)
+          else:
+            x[k] = np.asarray(v,np.float16)
+        return x
+      result = _jnp_to_np(self.apply(self.params, key, {**feat, "prev":prev}))
       prev = result.pop("prev")
       return result, prev
 
@@ -211,50 +169,31 @@ class RunModel:
     key = jax.random.PRNGKey(random_seed)
     
     # iterate through recyckes
-    stop = False
-    for r in range(num_iters):
-      
+    for r in range(num_iters):      
         # grab subset of features
         if self.multimer_mode:
-            sub_feat = feat
+          sub_feat = feat
         else:
-            s = r * num_ensemble
-            e = (r+1) * num_ensemble
-            sub_feat = jax.tree_map(lambda x:x[s:e], feat)
+          s = r * num_ensemble
+          e = (r+1) * num_ensemble
+          sub_feat = jax.tree_map(lambda x:x[s:e], feat)
             
         # run
         key, sub_key = jax.random.split(key)
         result, prev = run(sub_key, sub_feat, prev)
         
-        # compute confidence
-        seq_mask = feat["seq_mask"] if self.multimer_mode else feat["seq_mask"][0]
-        confidences = get_confidence_metrics(result, mask=seq_mask, rank_by=self.config.model.rank_by)
         if return_representations:
-          result["pae"] = result.pop("predicted_aligned_error")
-          result["representations"] = {"pair": prev["prev_pair"], "single": prev["prev_msa_first_row"]}
-        result.update(confidences)
-
-        # decide when to stop
-        tol = self.config.model.recycle_early_stop_tolerance
-        sco = self.config.model.stop_at_score
-        if result["ranking_confidence"] > sco:
-          stop = True
-        if not stop and tol > 0:
-          ca_idx = residue_constants.atom_order['CA']
-          pos = result["structure_module"]["final_atom_positions"][:,ca_idx]
-          dist = np.sqrt(np.square(pos[:,None]-pos[None,:]).sum(-1))
-          if r > 0:
-            sq_diff = np.square(dist - prev_dist)
-            mask_2d = seq_mask[:,None] * seq_mask[None,:]
-            result["diff"] = np.sqrt((sq_diff * mask_2d).sum()/mask_2d.sum())
-            if result["diff"] < tol:
-              stop = True
-          prev_dist = dist
+          result["representations"] = {"pair":   prev["prev_pair"],
+                                       "single": prev["prev_msa_first_row"]}
 
         # callback
         if callback is not None: callback(result, r)
 
-        if stop: break
+        # decide when to stop
+        if result["ranking_confidence"] > self.config.model.stop_at_score:
+          break
+        if r > 0 and result["tol"] < self.config.model.recycle_early_stop_tolerance:
+          break
 
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, r
