@@ -23,7 +23,7 @@ Lower-level modules up to EvoformerIteration are reused from modules.py.
 import functools
 from typing import Sequence
 
-from alphafold.common import residue_constants
+from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom_multimer
 from alphafold.model import common_modules
 from alphafold.model import folding_multimer
@@ -448,6 +448,14 @@ class AlphaFold(hk.Module):
     
     if not return_representations:
       del ret['representations']
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+
     return ret
 
 class EmbeddingsAndEvoformer(hk.Module):

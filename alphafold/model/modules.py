@@ -17,7 +17,7 @@
 The structure generation code is in 'folding.py'.
 """
 import functools
-from alphafold.common import residue_constants, confidence_jax
+from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom
 from alphafold.model import common_modules
 from alphafold.model import folding
@@ -31,12 +31,10 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 
-
 def softmax_cross_entropy(logits, labels):
   """Computes softmax cross entropy given logits and one-hot class labels."""
   loss = -jnp.sum(labels * jax.nn.log_softmax(logits), axis=-1)
   return jnp.asarray(loss)
-
 
 def sigmoid_cross_entropy(logits, labels):
   """Computes sigmoid cross entropy given logits and multiple class labels."""
@@ -45,7 +43,6 @@ def sigmoid_cross_entropy(logits, labels):
   log_not_p = jax.nn.log_sigmoid(-logits)
   loss = -labels * log_p - (1. - labels) * log_not_p
   return jnp.asarray(loss)
-
 
 def apply_dropout(*, tensor, safe_key, rate, is_training, broadcast_dim=None):
   """Applies dropout to a tensor."""
@@ -58,7 +55,6 @@ def apply_dropout(*, tensor, safe_key, rate, is_training, broadcast_dim=None):
     return keep * tensor / keep_rate
   else:
     return tensor
-
 
 def dropout_wrapper(module,
                     input_act,
@@ -94,9 +90,7 @@ def dropout_wrapper(module,
                            broadcast_dim=broadcast_dim)
 
   new_act = output_act + residual
-
   return new_act
-
 
 def create_extra_msa_feature(batch):
   """Expand extra_msa into 1hot and concat with other extra msa features.
@@ -194,10 +188,19 @@ class AlphaFold_noE(hk.Module):
       prev = {'prev_msa_first_row': jnp.zeros([L,256],  dtype=dtype),
               'prev_pair':          jnp.zeros([L,L,128],dtype=dtype),
               'prev_pos':           jnp.zeros([L,37,3])}
+    
     ret = impl(batch={**batch, **prev}, is_training=is_training)
     ret["prev"] = get_prev(ret)
     if not return_representations:
       del ret["representations"]
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))
+    
     return ret
 
 class AlphaFoldIteration(hk.Module):
@@ -439,7 +442,14 @@ class AlphaFold(hk.Module):
       
     if not return_representations:
       del (ret[0] if compute_loss else ret)['representations']  # pytype: disable=unsupported-operands
-      
+
+    # add confidence metrics
+    ret.update(confidence.get_confidence_metrics(
+      prediction_result=ret,
+      mask=batch["seq_mask"],
+      rank_by=self.config.rank_by,
+      use_jnp=True))      
+
     return ret
 
 class TemplatePairStack(hk.Module):

@@ -29,56 +29,6 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 import tree
 
-def get_confidence_metrics(
-    prediction_result: Mapping[str, Any],
-    mask: Any,
-    rank_by: str = "auto") -> Mapping[str, Any]:
-  """Post processes prediction_result to get confidence metrics."""  
-  confidence_metrics = {}
-
-  plddt = confidence.compute_plddt(prediction_result['predicted_lddt']['logits'])
-  confidence_metrics['plddt'] = plddt  
-  confidence_metrics["mean_plddt"] = (plddt * mask).sum()/mask.sum()
-
-  if 'predicted_aligned_error' in prediction_result:
-    confidence_metrics.update(confidence.compute_predicted_aligned_error(
-        logits=prediction_result['predicted_aligned_error']['logits'],
-        breaks=prediction_result['predicted_aligned_error']['breaks']))
-    
-    confidence_metrics['ptm'] = confidence.predicted_tm_score(
-        logits=prediction_result['predicted_aligned_error']['logits'],
-        breaks=prediction_result['predicted_aligned_error']['breaks'],
-        residue_weights=mask)    
-
-    asym_id = prediction_result["predicted_aligned_error"].get("asym_id",None)
-    if asym_id is not None and np.unique(asym_id).shape[0] > 1:
-      # Compute the ipTM only for the multimer model.
-      confidence_metrics['iptm'] = confidence.predicted_tm_score(
-          logits=prediction_result['predicted_aligned_error']['logits'],
-          breaks=prediction_result['predicted_aligned_error']['breaks'],
-          residue_weights=mask, asym_id=asym_id)
-
-  # decide what metric to use for the mean_score
-  if rank_by == "auto":
-    if  "iptm" in confidence_metrics:
-      rank_by = "multimer"
-    elif "ptm" in confidence_metrics:
-      rank_by = "ptm"
-    else:
-      rank_by = "plddt"
-  else:
-    if rank_by in ["multimer","iptm"] and "iptm" not in confidence_metrics: rank_by = "ptm"
-    if rank_by == "ptm" and "ptm" not in confidence_metrics: rank_by = "plddt"
-
-  # compute mean_score
-  if rank_by == "multimer": mean_score = 80 * confidence_metrics["iptm"] + 20 * confidence_metrics["ptm"]
-  if rank_by == "iptm":     mean_score = 100 * confidence_metrics["iptm"]
-  if rank_by == "ptm":      mean_score = 100 * confidence_metrics["ptm"]
-  if rank_by == "plddt":    mean_score = confidence_metrics["mean_plddt"]
-  confidence_metrics["ranking_confidence"] = mean_score
-  
-  return confidence_metrics
-
 class RunModel:
   """Container for JAX model."""
 
@@ -229,15 +179,9 @@ class RunModel:
         key, sub_key = jax.random.split(key)
         result, prev = run(sub_key, sub_feat, prev)
         
-        # compute confidence
-        seq_mask = feat["seq_mask"] if self.multimer_mode else feat["seq_mask"][0]
-        confidences = get_confidence_metrics(result, mask=seq_mask, rank_by=self.config.model.rank_by)
         if return_representations:
-          result["pae"] = result.pop("predicted_aligned_error")
           result["representations"] = {"pair":   prev["prev_pair"].astype(np.float32),
                                        "single": prev["prev_msa_first_row"].astype(np.float32)}
-        result.update(confidences)
-
         # decide when to stop
         tol = self.config.model.recycle_early_stop_tolerance
         sco = self.config.model.stop_at_score
@@ -249,6 +193,7 @@ class RunModel:
           dist = np.sqrt(np.square(pos[:,None]-pos[None,:]).sum(-1))
           if r > 0:
             sq_diff = np.square(dist - prev_dist)
+            seq_mask = feat["seq_mask"] if self.multimer_mode else feat["seq_mask"][0]
             mask_2d = seq_mask[:,None] * seq_mask[None,:]
             result["diff"] = np.sqrt((sq_diff * mask_2d).sum()/mask_2d.sum())
             if result["diff"] < tol:

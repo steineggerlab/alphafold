@@ -14,74 +14,67 @@
 
 """Functions for processing confidence metrics."""
 
-from typing import Dict, Optional, Tuple
+import jax.numpy as jnp
+import jax
 import numpy as np
 import scipy.special
 
-
-def compute_plddt(logits: np.ndarray) -> np.ndarray:
+def compute_plddt(logits, use_jnp=False):
   """Computes per-residue pLDDT from logits.
-
   Args:
     logits: [num_res, num_bins] output from the PredictedLDDTHead.
-
   Returns:
     plddt: [num_res] per-residue pLDDT.
   """
+  if use_jnp:
+    _np, _softmax = jnp, jax.nn.softmax
+  else:
+    _np, _softmax = np, scipy.special.softmax
+  
   num_bins = logits.shape[-1]
   bin_width = 1.0 / num_bins
-  bin_centers = np.arange(start=0.5 * bin_width, stop=1.0, step=bin_width)
-  probs = scipy.special.softmax(logits, axis=-1)
-  predicted_lddt_ca = np.sum(probs * bin_centers[None, :], axis=-1)
+  bin_centers = _np.arange(start=0.5 * bin_width, stop=1.0, step=bin_width)
+  probs = _softmax(logits, axis=-1)
+  predicted_lddt_ca = (probs * bin_centers[None, :]).sum(-1)
   return predicted_lddt_ca * 100
 
-
-def _calculate_bin_centers(breaks: np.ndarray):
+def _calculate_bin_centers(breaks, use_jnp=False):
   """Gets the bin centers from the bin edges.
-
   Args:
     breaks: [num_bins - 1] the error bin edges.
-
   Returns:
     bin_centers: [num_bins] the error bin centers.
   """
-  step = (breaks[1] - breaks[0])
+  _np = jnp if use_jnp else np
+  step = breaks[1] - breaks[0]
 
   # Add half-step to get the center
   bin_centers = breaks + step / 2
-  # Add a catch-all bin at the end.
-  bin_centers = np.concatenate([bin_centers, [bin_centers[-1] + step]],
-                               axis=0)
-  return bin_centers
 
+  # Add a catch-all bin at the end.
+  return _np.append(bin_centers, bin_centers[-1] + step)
 
 def _calculate_expected_aligned_error(
-    alignment_confidence_breaks: np.ndarray,
-    aligned_distance_error_probs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+  alignment_confidence_breaks,
+  aligned_distance_error_probs,
+  use_jnp=False):
   """Calculates expected aligned distance errors for every pair of residues.
-
   Args:
     alignment_confidence_breaks: [num_bins - 1] the error bin edges.
     aligned_distance_error_probs: [num_res, num_res, num_bins] the predicted
       probs for each error bin, for each pair of residues.
-
   Returns:
     predicted_aligned_error: [num_res, num_res] the expected aligned distance
       error for each pair of residues.
     max_predicted_aligned_error: The maximum predicted error possible.
   """
-  bin_centers = _calculate_bin_centers(alignment_confidence_breaks)
-
+  bin_centers = _calculate_bin_centers(alignment_confidence_breaks, use_jnp=use_jnp)
   # Tuple of expected aligned distance error and max possible error.
-  return (np.sum(aligned_distance_error_probs * bin_centers, axis=-1),
-          np.asarray(bin_centers[-1]))
+  pae = (aligned_distance_error_probs * bin_centers).sum(-1)
+  return (pae, bin_centers[-1])
 
-
-def compute_predicted_aligned_error(
-    logits: np.ndarray,
-    breaks: np.ndarray) -> Dict[str, np.ndarray]:
+def compute_predicted_aligned_error(logits, breaks, use_jnp=False):
   """Computes aligned confidence metrics from logits.
-
   Args:
     logits: [num_res, num_res, num_bins] the logits output from
       PredictedAlignedErrorHead.
@@ -94,25 +87,19 @@ def compute_predicted_aligned_error(
       error for each pair of residues.
     max_predicted_aligned_error: The maximum predicted error possible.
   """
-  aligned_confidence_probs = scipy.special.softmax(
-      logits,
-      axis=-1)
-  predicted_aligned_error, max_predicted_aligned_error = (
-      _calculate_expected_aligned_error(
-          alignment_confidence_breaks=breaks,
-          aligned_distance_error_probs=aligned_confidence_probs))
+  _softmax = jax.nn.softmax if use_jnp else scipy.special.softmax
+  aligned_confidence_probs = _softmax(logits,axis=-1)
+  predicted_aligned_error, max_predicted_aligned_error = \
+  _calculate_expected_aligned_error(breaks, aligned_confidence_probs, use_jnp=use_jnp)
+
   return {
       'aligned_confidence_probs': aligned_confidence_probs,
       'predicted_aligned_error': predicted_aligned_error,
       'max_predicted_aligned_error': max_predicted_aligned_error,
   }
 
-
-def predicted_tm_score(
-    logits: np.ndarray,
-    breaks: np.ndarray,
-    residue_weights: Optional[np.ndarray] = None,
-    asym_id: Optional[np.ndarray] = None) -> np.ndarray:
+def predicted_tm_score(logits, breaks, residue_weights = None,
+    asym_id = None, use_jnp=False):
   """Computes predicted TM alignment or predicted interface TM alignment score.
 
   Args:
@@ -127,17 +114,21 @@ def predicted_tm_score(
   Returns:
     ptm_score: The predicted TM alignment or the predicted iTM score.
   """
+  if use_jnp:
+    _np, _softmax = jnp, jax.nn.softmax
+  else:
+    _np, _softmax = np, scipy.special.softmax
 
   # residue_weights has to be in [0, 1], but can be floating-point, i.e. the
   # exp. resolved head's probability.
   if residue_weights is None:
-    residue_weights = np.ones(logits.shape[0])
+    residue_weights = _np.ones(logits.shape[0])
 
-  bin_centers = _calculate_bin_centers(breaks)
+  bin_centers = _calculate_bin_centers(breaks, use_jnp=use_jnp)
   num_res = residue_weights.shape[0]
 
   # Clip num_res to avoid negative/undefined d0.
-  clipped_num_res = max(np.sum(residue_weights), 19)
+  clipped_num_res = _np.maximum(residue_weights.sum(), 19)
 
   # Compute d_0(num_res) as defined by TM-score, eqn. (5) in Yang & Skolnick
   # "Scoring function for automated assessment of protein structure template
@@ -145,21 +136,62 @@ def predicted_tm_score(
   d0 = 1.24 * (clipped_num_res - 15) ** (1./3) - 1.8
 
   # Convert logits to probs.
-  probs = scipy.special.softmax(logits, axis=-1)
+  probs = _softmax(logits, axis=-1)
 
   # TM-Score term for every bin.
-  tm_per_bin = 1. / (1 + np.square(bin_centers) / np.square(d0))
+  tm_per_bin = 1. / (1 + _np.square(bin_centers) / _np.square(d0))
   # E_distances tm(distance).
-  predicted_tm_term = np.sum(probs * tm_per_bin, axis=-1)
+  predicted_tm_term = (probs * tm_per_bin).sum(-1)
 
   if asym_id is None:
-    pair_mask = np.ones((num_res,num_res), dtype=bool)
+    pair_mask = _np.full((num_res,num_res),True)
   else:
     pair_mask = asym_id[:, None] != asym_id[None, :]
 
   predicted_tm_term *= pair_mask
 
   pair_residue_weights = pair_mask * (residue_weights[None, :] * residue_weights[:, None])
-  normed_residue_mask = pair_residue_weights / (1e-8 + np.sum(pair_residue_weights, axis=-1, keepdims=True))
-  per_alignment = np.sum(predicted_tm_term * normed_residue_mask, axis=-1)
-  return np.asarray(per_alignment[(per_alignment * residue_weights).argmax()])
+  normed_residue_mask = pair_residue_weights / (1e-8 + pair_residue_weights.sum(-1, keepdims=True))
+  per_alignment = (predicted_tm_term * normed_residue_mask).sum(-1)
+
+  return (per_alignment * residue_weights).max()
+
+def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=False):
+  """Post processes prediction_result to get confidence metrics."""  
+  confidence_metrics = {}
+  plddt = compute_plddt(prediction_result['predicted_lddt']['logits'], use_jnp=use_jnp)
+  confidence_metrics['plddt'] = plddt  
+  confidence_metrics["mean_plddt"] = (plddt * mask).sum()/mask.sum()
+
+  if 'predicted_aligned_error' in prediction_result:
+    confidence_metrics.update(compute_predicted_aligned_error(
+        logits=prediction_result['predicted_aligned_error']['logits'],
+        breaks=prediction_result['predicted_aligned_error']['breaks'],
+        use_jnp=use_jnp))
+    
+    confidence_metrics['ptm'] = predicted_tm_score(
+        logits=prediction_result['predicted_aligned_error']['logits'],
+        breaks=prediction_result['predicted_aligned_error']['breaks'],
+        residue_weights=mask,
+        use_jnp=use_jnp)    
+
+    if "asym_id" in prediction_result["predicted_aligned_error"]:
+      # Compute the ipTM only for the multimer model.
+      confidence_metrics['iptm'] = predicted_tm_score(
+          logits=prediction_result['predicted_aligned_error']['logits'],
+          breaks=prediction_result['predicted_aligned_error']['breaks'],
+          residue_weights=mask,
+          asym_id=prediction_result['predicted_aligned_error']['asym_id'],
+          use_jnp=use_jnp)
+
+  # compute mean_score
+  if rank_by == "multimer":
+    mean_score = 80 * confidence_metrics["iptm"] + 20 * confidence_metrics["ptm"]
+  elif rank_by == "iptm":
+    mean_score = 100 * confidence_metrics["iptm"]
+  elif rank_by == "ptm":
+    mean_score = 100 * confidence_metrics["ptm"]
+  else:
+    mean_score = confidence_metrics["mean_plddt"]
+  confidence_metrics["ranking_confidence"] = mean_score
+  return confidence_metrics
