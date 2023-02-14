@@ -159,9 +159,10 @@ class AlphaFoldIteration_noE(hk.Module):
           representations.update(ret[name].pop('representations'))
 
     for name in ('predicted_lddt', 'predicted_aligned_error'):
-      ret[name] = heads[name](representations, batch, is_training)
-      if name == 'predicted_aligned_error' and "asym_id" in batch:
-        ret[name]['asym_id'] = batch['asym_id']
+      if name in heads:
+        ret[name] = heads[name](representations, batch, is_training)
+        if name == 'predicted_aligned_error' and "asym_id" in batch:
+          ret[name]['asym_id'] = batch['asym_id']
 
     return ret
 
