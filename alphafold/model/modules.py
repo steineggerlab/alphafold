@@ -185,6 +185,7 @@ class AlphaFold_noE(hk.Module):
 
     # initialize
     if prev is None:
+
       L = num_residues
       prev = {'prev_msa_first_row': jnp.zeros([L,256]),
               'prev_pair':          jnp.zeros([L,L,128]),
@@ -193,6 +194,7 @@ class AlphaFold_noE(hk.Module):
       for k,v in prev.items():
         if v.dtype == jnp.float16:
           prev[k] = v.astype(jnp.float32)
+
     
     ret = impl(batch={**batch, **prev}, is_training=is_training)
     ret["prev"] = get_prev(ret)
@@ -205,11 +207,13 @@ class AlphaFold_noE(hk.Module):
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
       use_jnp=True))
+      
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
       batch["seq_mask"], 
       use_jnp=True)
+
     return ret
 
 class AlphaFoldIteration(hk.Module):
@@ -435,7 +439,6 @@ class AlphaFold(hk.Module):
           ensemble_representations=ensemble_representations)
 
     emb_config = self.config.embeddings_and_evoformer
-    
     # initialize
     prev = batch.pop("prev", None)    
     if prev is None:
@@ -447,6 +450,7 @@ class AlphaFold(hk.Module):
       for k,v in prev.items():
         if v.dtype == jnp.float16:
           prev[k] = v.astype(jnp.float32)
+
 
     ret = do_call(prev=prev, recycle_idx=0)
     ret["prev"] = get_prev(ret)
@@ -463,11 +467,13 @@ class AlphaFold(hk.Module):
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
       use_jnp=True))      
+      
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
       batch["seq_mask"], 
       use_jnp=True)
+
     return ret
 
 class TemplatePairStack(hk.Module):

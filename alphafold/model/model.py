@@ -148,6 +148,7 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
+
     zeros = lambda shape: np.zeros(shape, dtype=np.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
             'prev_pair':          zeros([L,L,128]),
@@ -164,6 +165,7 @@ class RunModel:
       result = _jnp_to_np(self.apply(self.params, key, {**feat, "prev":prev}))
       prev = result.pop("prev")
       return result, prev
+
 
     # initialize random key
     key = jax.random.PRNGKey(random_seed)
@@ -183,9 +185,10 @@ class RunModel:
         result, prev = run(sub_key, sub_feat, prev)
         
         if return_representations:
+
           result["representations"] = {"pair":   prev["prev_pair"],
                                        "single": prev["prev_msa_first_row"]}
-
+                                       
         # callback
         if callback is not None: callback(result, r)
 

@@ -30,6 +30,7 @@ def compute_tol(prev_pos, current_pos, mask, use_jnp=False):
     mask_2d = mask[:,None] * mask[None,:]
     return _np.sqrt((sq_diff * mask_2d).sum()/mask_2d.sum() + 1e-8)
 
+
 def compute_plddt(logits, use_jnp=False):
   """Computes per-residue pLDDT from logits.
   Args:

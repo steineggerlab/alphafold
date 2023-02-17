@@ -467,11 +467,13 @@ class AlphaFold(hk.Module):
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
       use_jnp=True))
+
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
       batch["seq_mask"], 
       use_jnp=True)
+
     return ret
 
 class EmbeddingsAndEvoformer(hk.Module):
