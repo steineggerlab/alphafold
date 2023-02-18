@@ -464,14 +464,14 @@ class AlphaFold(hk.Module):
     # add confidence metrics
     ret.update(confidence.get_confidence_metrics(
       prediction_result=ret,
-      mask=batch["seq_mask"],
+      mask=batch["seq_mask"][0],
       rank_by=self.config.rank_by,
-      use_jnp=True))      
+      use_jnp=True))
       
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
-      batch["seq_mask"], 
+      batch["seq_mask"][0], 
       use_jnp=True)
 
     return ret
