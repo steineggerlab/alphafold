@@ -156,7 +156,7 @@ class RunModel:
       print("INFO: all_atom_positions provided, using as initial guess")
       prev["prev_pos"] = feat["all_atom_positions"]
     else:
-      print("WARNING: all_atom_positions not provided, using zeros as initial guess")
+      print("INFO: all_atom_positions not provided, using zeros as initial guess")
       prev["prev_pos"] = np.zeros([L,37,3])
     
     def run(key, feat, prev):
