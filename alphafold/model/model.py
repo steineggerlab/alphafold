@@ -147,9 +147,6 @@ class RunModel:
       num_ensemble = self.config.data.eval.num_ensemble
       L = aatype.shape[1]
     
-
-  
-
     zeros = lambda shape: np.zeros(shape, dtype=np.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
             'prev_pair':          zeros([L,L,128])}
