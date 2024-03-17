@@ -153,7 +153,7 @@ class RunModel:
     
     # initial guess
     if "all_atom_positions" in feat:
-      print("INFO: all_atom_positions provided, using as initial guess")
+      logging.info("INFO: using provided all_atom_positions as initial guess")
       prev["prev_pos"] = feat["all_atom_positions"]
     else:
       prev["prev_pos"] = np.zeros([L,37,3])
