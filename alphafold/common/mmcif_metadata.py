@@ -15,7 +15,6 @@
 """mmCIF metadata."""
 
 from typing import Mapping, Sequence
-from alphafold import version
 import numpy as np
 
 
@@ -162,7 +161,7 @@ def add_metadata_to_mmcif(
   cif['_ma_model_list.model_name'] = ['Top ranked model']
 
   cif['_ma_model_list.model_group_name'] = [
-      f'AlphaFold {model_type} v{version.__version__} model'
+      f'AlphaFold {model_type} v2.3.2 model'
   ]
   cif['_ma_model_list.data_id'] = ['1']
   cif['_ma_model_list.model_type'] = ['Ab initio model']
@@ -170,7 +169,7 @@ def add_metadata_to_mmcif(
   # Software used.
   cif['_software.pdbx_ordinal'] = ['1']
   cif['_software.name'] = ['AlphaFold']
-  cif['_software.version'] = [f'v{version.__version__}']
+  cif['_software.version'] = [f'v2.3.2']
   cif['_software.type'] = ['package']
   cif['_software.description'] = ['Structure prediction']
   cif['_software.classification'] = ['other']
