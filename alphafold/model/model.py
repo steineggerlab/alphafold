@@ -35,11 +35,13 @@ class RunModel:
   def __init__(self,
                config: ml_collections.ConfigDict,
                params: Optional[Mapping[str, Mapping[str, np.ndarray]]] = None,
-               is_training = False):
+               is_training = False, extended_metrics = False, use_probs_extended=True):
     
     self.config = config
     self.params = params
     self.multimer_mode = config.model.global_config.multimer_mode
+    self.config.model.extended_metrics = extended_metrics
+    self.config.model.use_probs_extended = use_probs_extended
 
     if self.multimer_mode:
       def _forward_fn(batch):
@@ -148,7 +150,6 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-
     zeros = lambda shape: np.zeros(shape, dtype=np.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
             'prev_pair':          zeros([L,L,128]),

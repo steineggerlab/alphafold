@@ -416,7 +416,6 @@ class AlphaFold(hk.Module):
       is_training,
       return_representations=False,
       safe_key=None):
-
     c = self.config
     impl = AlphaFoldIteration(c, self.global_config)
 
@@ -466,7 +465,10 @@ class AlphaFold(hk.Module):
       prediction_result=ret,
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
-      use_jnp=True))
+      use_jnp=True,
+      calc_extended_metrics=self.config.extended_metrics,
+      use_probs_extended=self.config.use_probs_extended))
+    print(ret.keys())
 
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 

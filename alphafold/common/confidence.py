@@ -19,6 +19,7 @@ import jax
 import numpy as np
 from alphafold.common import residue_constants
 import scipy.special
+from alphafold.common import extended_metrics
 
 def compute_tol(prev_pos, current_pos, mask, use_jnp=False):
     # Early stopping criteria based on criteria used in
@@ -168,7 +169,7 @@ def predicted_tm_score(logits, breaks, residue_weights = None,
 
   return (per_alignment * residue_weights).max()
 
-def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=False):
+def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=False, calc_extended_metrics=False, use_probs_extended=True):
   """Post processes prediction_result to get confidence metrics."""  
   confidence_metrics = {}
   plddt = compute_plddt(prediction_result['predicted_lddt']['logits'], use_jnp=use_jnp)
@@ -185,7 +186,7 @@ def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=F
         logits=prediction_result['predicted_aligned_error']['logits'],
         breaks=prediction_result['predicted_aligned_error']['breaks'],
         residue_weights=mask,
-        use_jnp=use_jnp)    
+        use_jnp=use_jnp)
 
     if "asym_id" in prediction_result["predicted_aligned_error"]:
       # Compute the ipTM only for the multimer model.
@@ -195,6 +196,34 @@ def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=F
           residue_weights=mask,
           asym_id=prediction_result['predicted_aligned_error']['asym_id'],
           use_jnp=use_jnp)
+
+
+      # Calculate interaction metrics (ipTM and actifpTM) for interface and also, chain-wise pTM
+      # if calc_extended_metrics:
+      #   new_ptms = extended_metrics.get_chain_and_interface_metrics(prediction_result,
+      #                                                prediction_result['predicted_aligned_error']['asym_id'],
+      #                                                use_probs_extended=use_probs_extended)
+      #   confidence_metrics.update(new_ptms)
+
+      # Calculate interaction metrics (ipTM and actifpTM) for interface and also, chain-wise pTM
+      # if calc_extended_metrics:
+      #   # Use pure_callback to call the Python function. This is because asym_id is not compatible which JAX tracing
+      #   (pairwise_actifptm_keys, pairwise_iptm_keys, per_chain_ptm_keys,
+      #    pairwise_actifptm_values, pairwise_iptm_values, per_chain_ptm_values) = jax.pure_callback(
+      #       extended_metrics.get_chain_and_interface_metrics,  # Directly use the function here
+      #       jax.core.ShapedArray(prediction_result.shape, prediction_result.dtype),  # Define the expected shape & type
+      #       prediction_result,
+      #       prediction_result['predicted_aligned_error']['asym_id'],  # Extract asym_id dynamically here
+      #       use_probs_extended
+      #   )
+      #   new_ptms = {}
+      #   new_ptms['pairwise_actifptm'] = dict(zip(pairwise_actifptm_keys, pairwise_actifptm_values))
+      #   new_ptms['pairwise_iptm'] = dict(zip(pairwise_iptm_keys, pairwise_iptm_values))
+      #   new_ptms['per_chain_ptm'] = dict(zip(per_chain_ptm_keys, per_chain_ptm_values))
+
+        confidence_metrics.update(new_ptms)
+
+  # Reconstruct the dictionaries
 
   # compute mean_score
   if rank_by == "multimer":
