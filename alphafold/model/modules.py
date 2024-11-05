@@ -461,12 +461,6 @@ class AlphaFold(hk.Module):
     if not return_representations:
       del (ret[0] if compute_loss else ret)['representations']  # pytype: disable=unsupported-operands
 
-    # Need to put actipftm here!
-    import pickle
-
-    with open('/sci/labs/fora/jvarga/works/ColabFold/result_full.pkl', 'wb') as file:
-        pickle.dump(ret, file)
-
     # add confidence metrics
     ret.update(confidence.get_confidence_metrics(
       prediction_result=ret,

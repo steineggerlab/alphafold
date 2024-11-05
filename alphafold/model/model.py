@@ -35,13 +35,13 @@ class RunModel:
   def __init__(self,
                config: ml_collections.ConfigDict,
                params: Optional[Mapping[str, Mapping[str, np.ndarray]]] = None,
-               is_training = False, extended_metrics = False, use_probs_extended=True):
+               is_training = False, extended_metrics_config=None):
     
     self.config = config
     self.params = params
     self.multimer_mode = config.model.global_config.multimer_mode
-    self.config.model.extended_metrics = extended_metrics
-    self.config.model.use_probs_extended = use_probs_extended
+    self.config.model.calc_extended_metrics = extended_metrics_config['calc_extended_metrics'] if extended_metrics_config else False
+    self.config.model.use_probs_extended = extended_metrics_config['use_probs_extended'] if extended_metrics_config else False
 
     if self.multimer_mode:
       def _forward_fn(batch):
@@ -171,7 +171,7 @@ class RunModel:
     # initialize random key
     key = jax.random.PRNGKey(random_seed)
     
-    # iterate through recyckes
+    # iterate through recycles
     for r in range(num_iters):      
         # grab subset of features
         if self.multimer_mode:
@@ -198,6 +198,5 @@ class RunModel:
           break
         if r > 0 and result["tol"] < self.config.model.recycle_early_stop_tolerance:
           break
-
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, r

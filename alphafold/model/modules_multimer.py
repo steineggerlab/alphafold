@@ -443,7 +443,7 @@ class AlphaFold(hk.Module):
           safe_key=safe_key)
     
     # initialize
-    prev = batch.pop("prev", None)    
+    prev = batch.pop("prev", None)
     if prev is None:
       L = num_residues
       prev = {'prev_msa_first_row': jnp.zeros([L,256]),
@@ -456,7 +456,7 @@ class AlphaFold(hk.Module):
 
     ret = apply_network(prev=prev, safe_key=safe_key)
     ret["prev"] = get_prev(ret)
-    
+
     if not return_representations:
       del ret['representations']
 
@@ -466,9 +466,7 @@ class AlphaFold(hk.Module):
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
       use_jnp=True,
-      calc_extended_metrics=self.config.extended_metrics,
-      use_probs_extended=self.config.use_probs_extended))
-    print(ret.keys())
+      keep_pae=self.config.calc_extended_metrics))
 
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
