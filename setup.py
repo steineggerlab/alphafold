@@ -18,7 +18,7 @@ from setuptools import setup
 
 setup(
     name='alphafold-colabfold',
-    version='2.3.6',
+    version='2.3.7',
     long_description_content_type='text/markdown',
     description='An implementation of the inference pipeline of AlphaFold v2.3.1. '
     'This is a completely new model that was entered as AlphaFold2 in CASP14 '
