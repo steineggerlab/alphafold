@@ -20,6 +20,7 @@ import numpy as np
 from alphafold.common import residue_constants
 import scipy.special
 
+
 def compute_tol(prev_pos, current_pos, mask, use_jnp=False):
     # Early stopping criteria based on criteria used in
     # AF2Complex: https://www.nature.com/articles/s41467-022-29394-2    
@@ -168,7 +169,7 @@ def predicted_tm_score(logits, breaks, residue_weights = None,
 
   return (per_alignment * residue_weights).max()
 
-def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=False):
+def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=False, keep_pae=False):
   """Post processes prediction_result to get confidence metrics."""  
   confidence_metrics = {}
   plddt = compute_plddt(prediction_result['predicted_lddt']['logits'], use_jnp=use_jnp)
@@ -176,16 +177,19 @@ def get_confidence_metrics(prediction_result, mask, rank_by = "plddt", use_jnp=F
   confidence_metrics["mean_plddt"] = (plddt * mask).sum()/mask.sum()
 
   if 'predicted_aligned_error' in prediction_result:
+    if keep_pae:
+        prediction_result['pae_matrix_with_logits'] = prediction_result['predicted_aligned_error']
+
     confidence_metrics.update(compute_predicted_aligned_error(
         logits=prediction_result['predicted_aligned_error']['logits'],
         breaks=prediction_result['predicted_aligned_error']['breaks'],
         use_jnp=use_jnp))
-    
+
     confidence_metrics['ptm'] = predicted_tm_score(
         logits=prediction_result['predicted_aligned_error']['logits'],
         breaks=prediction_result['predicted_aligned_error']['breaks'],
         residue_weights=mask,
-        use_jnp=use_jnp)    
+        use_jnp=use_jnp)
 
     if "asym_id" in prediction_result["predicted_aligned_error"]:
       # Compute the ipTM only for the multimer model.

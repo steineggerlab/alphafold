@@ -416,7 +416,6 @@ class AlphaFold(hk.Module):
       is_training,
       return_representations=False,
       safe_key=None):
-
     c = self.config
     impl = AlphaFoldIteration(c, self.global_config)
 
@@ -444,7 +443,7 @@ class AlphaFold(hk.Module):
           safe_key=safe_key)
     
     # initialize
-    prev = batch.pop("prev", None)    
+    prev = batch.pop("prev", None)
     if prev is None:
       L = num_residues
       prev = {'prev_msa_first_row': jnp.zeros([L,256]),
@@ -457,7 +456,7 @@ class AlphaFold(hk.Module):
 
     ret = apply_network(prev=prev, safe_key=safe_key)
     ret["prev"] = get_prev(ret)
-    
+
     if not return_representations:
       del ret['representations']
 
@@ -466,7 +465,9 @@ class AlphaFold(hk.Module):
       prediction_result=ret,
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
-      use_jnp=True))
+      keep_pae=self.config.calc_extended_ptm,
+      use_jnp=True
+      ))
 
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 

@@ -206,6 +206,7 @@ class AlphaFold_noE(hk.Module):
       prediction_result=ret,
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
+      keep_pae=self.config.calc_extended_ptm,
       use_jnp=True))
       
     ret["tol"] = confidence.compute_tol(
@@ -467,7 +468,7 @@ class AlphaFold(hk.Module):
       mask=batch["seq_mask"][0],
       rank_by=self.config.rank_by,
       use_jnp=True))
-      
+
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
