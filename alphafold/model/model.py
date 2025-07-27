@@ -152,8 +152,14 @@ class RunModel:
     # initialize
     zeros = lambda shape: np.zeros(shape, dtype=np.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
-            'prev_pair':          zeros([L,L,128]),
-            'prev_pos':           zeros([L,37,3])}
+            'prev_pair':          zeros([L,L,128])}
+    
+    # initial guess
+    if "all_atom_positions" in feat:
+      logging.info("INFO: using provided all_atom_positions as initial guess")
+      prev["prev_pos"] = feat["all_atom_positions"]
+    else:
+      prev["prev_pos"] = np.zeros([L,37,3])
     
     def run(key, feat, prev):
       def _jnp_to_np(x):
