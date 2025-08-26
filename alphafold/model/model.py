@@ -185,7 +185,7 @@ class RunModel:
         else:
           s = r * num_ensemble
           e = (r+1) * num_ensemble
-          sub_feat = jax.tree_map(lambda x:x[s:e], feat)
+          sub_feat = jax.tree_util.tree_map(lambda x:x[s:e], feat)
             
         # run
         key, sub_key = jax.random.split(key)
