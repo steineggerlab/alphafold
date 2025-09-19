@@ -102,7 +102,7 @@ class Hmmsearch(object):
 
       logging.info('Launching sub-process %s', cmd)
       process = subprocess.Popen(
-          cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
       with utils.timing(
           f'hmmsearch ({os.path.basename(self.database_path)}) query'):
         stdout, stderr = process.communicate()

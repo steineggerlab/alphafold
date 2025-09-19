@@ -119,7 +119,7 @@ class Hmmbuild(object):
       ])
 
       logging.info('Launching subprocess %s', cmd)
-      process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+      process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
 
       with utils.timing('hmmbuild query'):
