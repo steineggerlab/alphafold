@@ -127,7 +127,7 @@ class HHBlits:
 
       logging.info('Launching subprocess "%s"', ' '.join(cmd))
       process = subprocess.Popen(
-          cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
       with utils.timing('HHblits query'):
         stdout, stderr = process.communicate()
