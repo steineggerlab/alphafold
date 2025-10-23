@@ -17,7 +17,7 @@
 import functools
 import inspect
 
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, TypeVar, Union
 
 import haiku as hk
 import jax
@@ -29,6 +29,16 @@ PYTREE_JAX_ARRAY = Any
 
 partial = functools.partial
 PROXY = object()
+
+T = TypeVar('T')
+def _set_docstring(docstr: str) -> Callable[[T], T]:
+  """Decorator for setting the docstring of a function."""
+
+  def wrapped(fun: T) -> T:
+    fun.__doc__ = docstr.format(fun=getattr(fun, '__name__', repr(fun)))
+    return fun
+
+  return wrapped
 
 
 def _maybe_slice(array, i, slice_size, axis):
@@ -83,7 +93,6 @@ def sharded_map(
     vmapped_fun = hk.vmap(fun, in_axes, out_axes)
   return sharded_apply(vmapped_fun, shard_size, in_axes, out_axes)
 
-
 def sharded_apply(
     fun: Callable[..., PYTREE_JAX_ARRAY],  # pylint: disable=g-bare-generic
     shard_size: Union[int, None] = 1,
@@ -120,7 +129,8 @@ def sharded_apply(
   if shard_size is None:
     return fun
 
-  @jax.util.wraps(fun, docstr=docstr)
+  @_set_docstring(docstr)
+  @functools.wraps(fun)
   def mapped_fn(*args):
     # Expand in axes and Determine Loop range
     in_axes_ = _expand_axes(in_axes, args)
@@ -159,10 +169,10 @@ def sharded_apply(
             remainder_shape[axis],) + shard_shape[axis + 1:]
 
       out_shapes = jax.tree_util.tree_map(make_output_shape, out_axes_, shard_shapes,
-                                out_shapes)
+                                     out_shapes)
 
     # Calls dynamic Update slice with different argument order
-    # This is here since tree_map only works with positional arguments
+    # This is here since tree_multimap only works with positional arguments
     def dynamic_update_slice_in_dim(full_array, update, axis, i):
       return jax.lax.dynamic_update_slice_in_dim(full_array, update, i, axis)
 
