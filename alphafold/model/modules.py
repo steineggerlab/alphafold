@@ -20,6 +20,7 @@ import functools
 from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom
 from alphafold.model import common_modules
+from alphafold.model import cueq
 from alphafold.model import folding
 from alphafold.model import layer_stack
 from alphafold.model import lddt
@@ -186,7 +187,7 @@ class AlphaFold_noE(hk.Module):
     # initialize
     if prev is None:
 
-      L = num_residues
+      L = batch["aatype"].shape[0]
       prev = {'prev_msa_first_row': jnp.zeros([L,256]),
               'prev_pair':          jnp.zeros([L,L,128]),
               'prev_pos':           jnp.zeros([L,37,3])}
@@ -667,16 +668,25 @@ class Attention(hk.Module):
         dtype=q_data.dtype,
         init=glorot_uniform())
 
-    q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim**(-0.5)
+    q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights)
     k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
     v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
-    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
-    if nonbatched_bias is not None:
-      logits += jnp.expand_dims(nonbatched_bias, axis=0)
-    # fix NaN's in jax >= 0.4, different fix than in AF2
-    logits = jnp.clip(logits, -1e8, 1e8)
-    weights = jax.nn.softmax(logits)
-    weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
+
+    # fused cuEquivariance flash-attention kernel replaces score+softmax+value without materializing the [N_q, N_k] matrix
+    if (self.global_config.get('use_cueq', False)
+        and q.dtype in (jnp.bfloat16, jnp.float16)
+        and cueq.available()):
+      weighted_avg = cueq.attention(
+          q, k, v, bias, nonbatched_bias, scale=key_dim**(-0.5))
+    else:
+      q = q * key_dim**(-0.5)
+      logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
+      if nonbatched_bias is not None:
+        logits += jnp.expand_dims(nonbatched_bias, axis=0)
+      # fix NaN's in jax >= 0.4, different fix than in AF2
+      logits = jnp.clip(logits, -1e8, 1e8)
+      weights = jax.nn.softmax(logits)
+      weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
     if self.global_config.zero_init:
       init = hk.initializers.Constant(0.0)
@@ -1474,6 +1484,13 @@ class TriangleMultiplication(hk.Module):
     c = self.config
     gc = self.global_config
 
+    # fused cuEquivariance kernel replaces projection + gate + einsum + output stack
+    if (gc.get('use_cueq', False)
+        and left_act.dtype in (jnp.bfloat16, jnp.float16)
+        and cueq.available()):
+      return cueq.triangle_multiply(
+          left_act, left_mask, c.equation, c.num_intermediate_channel)
+
     left_act = _layer_norm(axis=-1, name='left_norm_input')(left_act)
 
     # Both left and right projections are fused into projection.
@@ -1931,7 +1948,7 @@ class EmbeddingsAndEvoformer(hk.Module):
         # Add one-hot-encoded clipped residue distances to the pair activations.
         pos = batch['residue_index']
         offset = pos[:,None] - pos[None,:]
-        offset = jnp.clip(offset + c.max_relative_feature, a_min=0, a_max=2 * c.max_relative_feature)
+        offset = jnp.clip(offset + c.max_relative_feature, 0, 2 * c.max_relative_feature)
         if "asym_id" in batch:
           o = batch['asym_id'][:,None] - batch['asym_id'][None,:]
           offset = jnp.where(o == 0, offset, jnp.where(o > 0, 2*c.max_relative_feature, 0))
