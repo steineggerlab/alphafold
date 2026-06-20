@@ -510,6 +510,7 @@ class EmbeddingsAndEvoformer(hk.Module):
     """
     c = self.config
     gc = self.global_config
+    common_modules.set_use_pallas(gc.get('use_pallas', False))
     rel_feats = []
     pos = batch['residue_index']
     asym_id = batch['asym_id']

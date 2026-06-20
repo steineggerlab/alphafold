@@ -25,6 +25,16 @@ import numpy as np
 TRUNCATED_NORMAL_STDDEV_FACTOR = np.asarray(.87962566103423978,
                                             dtype=np.float32)
 
+# Whether the Pallas fused-LayerNorm kernel is enabled. LayerNorm has no access
+# to global_config, so the model sets this once (from global_config.use_pallas)
+# at the start of EmbeddingsAndEvoformer, before any LayerNorm is traced.
+_use_pallas = False
+
+
+def set_use_pallas(enabled: bool):
+  global _use_pallas
+  _use_pallas = bool(enabled)
+
 
 def get_initializer_scale(initializer_name, input_shape):
   """Get Initializer for weights and scale to multiply activations by."""
@@ -161,6 +171,16 @@ class LayerNorm(hk.LayerNorm):
     self._temp_create_offset = create_offset
 
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    # Fused Pallas layernorm replaces upcast + layernorm + downcast in one kernel
+    _last = (self.param_axis is None or tuple(self.param_axis) == (-1,))
+    if (_use_pallas and x.dtype == jnp.bfloat16 and _last
+        and self._temp_create_scale and self._temp_create_offset):
+      from alphafold.model.tri_mul import pallas_layer_norm
+      c = x.shape[-1]
+      scale = hk.get_parameter('scale', (c,), jnp.float32, init=self.scale_init)
+      offset = hk.get_parameter('offset', (c,), jnp.float32, init=self.offset_init)
+      return pallas_layer_norm(x, scale, offset, eps=self.eps)
+
     is_bf16 = (x.dtype == jnp.bfloat16)
     if is_bf16:
       x = x.astype(jnp.float32)

@@ -20,7 +20,6 @@ import functools
 from alphafold.common import residue_constants, confidence
 from alphafold.model import all_atom
 from alphafold.model import common_modules
-from alphafold.model import cueq
 from alphafold.model import folding
 from alphafold.model import layer_stack
 from alphafold.model import lddt
@@ -668,25 +667,58 @@ class Attention(hk.Module):
         dtype=q_data.dtype,
         init=glorot_uniform())
 
+    # Pallas/Triton flash-attention kernel replaces score+softmax+value
+    # without materializing the [N_q, N_k] matrix
+    if (self.global_config.get('use_pallas', False)
+        and q_data.dtype in (jnp.bfloat16, jnp.float16)):
+      from alphafold.model.tri_flash import pallas_attention
+      q = jnp.einsum('bqa,ahc->bhqc', q_data, q_weights)
+      k = jnp.einsum('bka,ahc->bhkc', m_data, k_weights)
+      v = jnp.einsum('bka,ahc->bhkc', m_data, v_weights)
+      weighted_avg = pallas_attention(
+          q, k, v, bias, nonbatched_bias, scale=key_dim**(-0.5))  # [b, h, q, c]
+
+      if self.config.gating:
+        gating_weights = hk.get_parameter(
+            'gating_w',
+            shape=(q_data.shape[-1], num_head, value_dim),
+            dtype=q_data.dtype,
+            init=hk.initializers.Constant(0.0))
+        gating_bias = hk.get_parameter(
+            'gating_b',
+            shape=(num_head, value_dim),
+            dtype=q_data.dtype,
+            init=hk.initializers.Constant(1.0))
+        gate_values = jnp.einsum('bqc,chv->bhqv', q_data,
+                                 gating_weights) + gating_bias[:, None, :]
+        weighted_avg = weighted_avg * jax.nn.sigmoid(gate_values)
+
+      if self.global_config.zero_init:
+        o_init = hk.initializers.Constant(0.0)
+      else:
+        o_init = glorot_uniform()
+      o_weights = hk.get_parameter(
+          'output_w', shape=(num_head, value_dim, self.output_dim),
+          dtype=q_data.dtype,
+          init=o_init)
+      o_bias = hk.get_parameter(
+          'output_b', shape=(self.output_dim,),
+          dtype=q_data.dtype,
+          init=hk.initializers.Constant(0.0))
+      return jnp.einsum('bhqc,hco->bqo', weighted_avg, o_weights) + o_bias
+
     q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights)
     k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
     v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
 
-    # fused cuEquivariance flash-attention kernel replaces score+softmax+value without materializing the [N_q, N_k] matrix
-    if (self.global_config.get('use_cueq', False)
-        and q.dtype in (jnp.bfloat16, jnp.float16)
-        and cueq.available()):
-      weighted_avg = cueq.attention(
-          q, k, v, bias, nonbatched_bias, scale=key_dim**(-0.5))
-    else:
-      q = q * key_dim**(-0.5)
-      logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
-      if nonbatched_bias is not None:
-        logits += jnp.expand_dims(nonbatched_bias, axis=0)
-      # fix NaN's in jax >= 0.4, different fix than in AF2
-      logits = jnp.clip(logits, -1e8, 1e8)
-      weights = jax.nn.softmax(logits)
-      weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
+    q = q * key_dim**(-0.5)
+    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
+    if nonbatched_bias is not None:
+      logits += jnp.expand_dims(nonbatched_bias, axis=0)
+    # fix NaN's in jax >= 0.4, different fix than in AF2
+    logits = jnp.clip(logits, -1e8, 1e8)
+    weights = jax.nn.softmax(logits)
+    weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
     if self.global_config.zero_init:
       init = hk.initializers.Constant(0.0)
@@ -883,12 +915,17 @@ class MSARowAttentionWithPairBias(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    msa_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[msa_act, msa_act, bias],
-        nonbatched_args=[nonbatched_bias],
-        low_memory=not is_training)
+    if self.global_config.get('use_pallas', False):
+      # Pallas flash attention doesn't materialize the [N,N] matrix
+      # memory-saving subbatch chunking is unneeded
+      msa_act = attn_mod(msa_act, msa_act, bias, nonbatched_bias)
+    else:
+      msa_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[msa_act, msa_act, bias],
+          nonbatched_args=[nonbatched_bias],
+          low_memory=not is_training)
 
     return msa_act
 
@@ -936,12 +973,15 @@ class MSAColumnAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    msa_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[msa_act, msa_act, bias],
-        nonbatched_args=[],
-        low_memory=not is_training)
+    if self.global_config.get('use_pallas', False):
+      msa_act = attn_mod(msa_act, msa_act, bias)
+    else:
+      msa_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[msa_act, msa_act, bias],
+          nonbatched_args=[],
+          low_memory=not is_training)
 
     msa_act = jnp.swapaxes(msa_act, -2, -3)
 
@@ -1056,12 +1096,15 @@ class TriangleAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, pair_act.shape[-1])
-    pair_act = mapping.inference_subbatch(
-        attn_mod,
-        self.global_config.subbatch_size,
-        batched_args=[pair_act, pair_act, bias],
-        nonbatched_args=[nonbatched_bias],
-        low_memory=not is_training)
+    if self.global_config.get('use_pallas', False):
+      pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
+    else:
+      pair_act = mapping.inference_subbatch(
+          attn_mod,
+          self.global_config.subbatch_size,
+          batched_args=[pair_act, pair_act, bias],
+          nonbatched_args=[nonbatched_bias],
+          low_memory=not is_training)
 
     if c.orientation == 'per_column':
       pair_act = jnp.swapaxes(pair_act, -2, -3)
@@ -1484,27 +1527,56 @@ class TriangleMultiplication(hk.Module):
     c = self.config
     gc = self.global_config
 
-    # fused cuEquivariance kernel replaces projection + gate + einsum + output stack
-    if (gc.get('use_cueq', False)
-        and left_act.dtype in (jnp.bfloat16, jnp.float16)
-        and cueq.available()):
-      return cueq.triangle_multiply(
-          left_act, left_mask, c.equation, c.num_intermediate_channel)
-
     left_act = _layer_norm(axis=-1, name='left_norm_input')(left_act)
 
-    # Both left and right projections are fused into projection.
-    projection = common_modules.Linear(
-        2*c.num_intermediate_channel, name='projection')
-    proj_act = mask * projection(left_act)
+    if (gc.get('use_pallas', False)
+        and left_act.dtype in (jnp.bfloat16, jnp.float16)):
+      # Pallas fused masked sigmoid-gated dual projection
+      from alphafold.model.tri_mul import gated_dual_proj
+      ci = c.num_intermediate_channel
+      cz = left_act.shape[-1]
+      n0, n1 = left_act.shape[0], left_act.shape[1]
+      def _proj_w(name):
+        with hk.experimental.name_scope(name):
+          w = hk.get_parameter('weights', (cz, 2 * ci), left_act.dtype,
+                               init=hk.initializers.TruncatedNormal())
+          b = hk.get_parameter('bias', (2 * ci,), left_act.dtype,
+                               init=hk.initializers.Constant(0.))
+        return w, b
+      p_w, p_b = _proj_w('projection')
+      g_w, g_b = _proj_w('gate')
+      # split=True returns the left/right projections as two contiguous arrays
+      # (the [N,N,2ci]->[N,N,ci]x2 split is done in-kernel), so the strided
+      # slice copies below are skipped entirely.
+      left_p, right_p = gated_dual_proj(
+          left_act.reshape(-1, cz), p_w, p_b, g_w, g_b,
+          left_mask.reshape(-1), split=True)
+      left_proj_act = left_p.reshape(n0, n1, ci)
+      right_proj_act = right_p.reshape(n0, n1, ci)
+      act = jnp.einsum(c.equation, left_proj_act, right_proj_act)
+      act = _layer_norm(axis=-1, name='center_norm')(act)
+      output_channel = int(left_act.shape[-1])
+      act = common_modules.Linear(
+          output_channel, initializer=utils.final_init(gc),
+          name='output_projection')(act)
+      gate_values = common_modules.Linear(
+          output_channel, bias_init=1.,
+          initializer=utils.final_init(gc), name='gating_linear')(left_act)
+      act *= jax.nn.sigmoid(gate_values)
+      return act
+    else:
+      # Both left and right projections are fused into projection.
+      projection = common_modules.Linear(
+          2*c.num_intermediate_channel, name='projection')
+      proj_act = mask * projection(left_act)
 
-    # Both left + right gate are fused into gate_values.
-    gate_values = common_modules.Linear(
-        2 * c.num_intermediate_channel,
-        name='gate',
-        bias_init=1.,
-        initializer=utils.final_init(gc))(left_act)
-    proj_act *= jax.nn.sigmoid(gate_values)
+      # Both left + right gate are fused into gate_values.
+      gate_values = common_modules.Linear(
+          2 * c.num_intermediate_channel,
+          name='gate',
+          bias_init=1.,
+          initializer=utils.final_init(gc))(left_act)
+      proj_act *= jax.nn.sigmoid(gate_values)
 
     left_proj_act = proj_act[:, :, :c.num_intermediate_channel]
     right_proj_act = proj_act[:, :, c.num_intermediate_channel:]
@@ -1890,6 +1962,7 @@ class EmbeddingsAndEvoformer(hk.Module):
     c = self.config
     gc = self.global_config
     dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+    common_modules.set_use_pallas(gc.get('use_pallas', False))
 
     if safe_key is None:
       safe_key = prng.SafeKey(hk.next_rng_key())
