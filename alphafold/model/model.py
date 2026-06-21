@@ -159,7 +159,7 @@ class RunModel:
       logging.info("INFO: using provided all_atom_positions as initial guess")
       prev["prev_pos"] = feat["all_atom_positions"]
     else:
-      prev["prev_pos"] = np.zeros([L,37,3])
+      prev["prev_pos"] = zeros([L,37,3])
     
     def run(key, feat, prev):
       def _jnp_to_np(x):
