@@ -16,7 +16,7 @@
 
 from alphafold.model.tf import data_transforms
 from alphafold.model.tf import shape_placeholders
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 import tree
 
 # Pylint gets confused by the curry1 decorator because it changes the number

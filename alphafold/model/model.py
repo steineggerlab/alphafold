@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import numpy as np
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 import tree
 
 class RunModel:

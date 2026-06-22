@@ -16,7 +16,7 @@
 import enum
 from typing import Dict, Optional, Sequence, Tuple, Union
 from alphafold.common import residue_constants
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 
 # Type aliases.
 FeaturesMetadata = Dict[str, Tuple[tf.dtypes.DType, Sequence[Union[str, int]]]]

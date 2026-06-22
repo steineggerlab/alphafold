@@ -21,7 +21,7 @@ from alphafold.model.tf import proteins_dataset
 
 import ml_collections
 import numpy as np
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 
 FeatureDict = Mapping[str, np.ndarray]
 

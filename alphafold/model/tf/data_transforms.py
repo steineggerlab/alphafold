@@ -19,7 +19,7 @@ from alphafold.model.tf import shape_helpers
 from alphafold.model.tf import shape_placeholders
 from alphafold.model.tf import utils
 import numpy as np
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 
 # Pylint gets confused by the curry1 decorator because it changes the number
 #   of arguments to the function.
@@ -105,7 +105,7 @@ def correct_msa_restypes(protein):
 
   for k in protein:
     if 'profile' in k:  # Include both hhblits and psiblast profiles
-      num_dim = protein[k].shape.as_list()[-1]
+      num_dim = int(protein[k].shape[-1])
       assert num_dim in [20, 21, 22], (
           'num_dim for %s out of expected range: %s' % (k, num_dim))
       protein[k] = tf.tensordot(protein[k], perm_matrix[:num_dim, :num_dim], 1)
@@ -140,6 +140,8 @@ def make_random_crop_to_size_seed(protein):
 @curry1
 def randomly_replace_msa_with_unknown(protein, replace_proportion):
   """Replace a proportion of the MSA with 'X'."""
+  if replace_proportion == 0.:
+    return tf.fast_randomly_replace_msa_with_unknown(protein)
   msa_mask = (tf.random.uniform(shape_helpers.shape_list(protein['msa'])) <
               replace_proportion)
   x_idx = 20
@@ -251,6 +253,8 @@ def block_delete_msa(protein, config):
 @curry1
 def nearest_neighbor_clusters(protein, gap_agreement_weight=0.):
   """Assign each extra MSA sequence to its nearest neighbor in sampled MSA."""
+  if gap_agreement_weight == 0.:
+    return tf.fast_nearest_neighbor_clusters(protein)
 
   # Determine how much weight we assign to each agreement.  In theory, we could
   # use a full blosum matrix here, but right now let's just down-weight gap
@@ -287,6 +291,8 @@ def nearest_neighbor_clusters(protein, gap_agreement_weight=0.):
 @curry1
 def summarize_clusters(protein):
   """Produce profile and deletion_matrix_mean within each cluster."""
+  if True:
+    return tf.fast_summarize_clusters(protein)
   num_seq = shape_helpers.shape_list(protein['msa'])[0]
   def csum(x):
     return tf.math.unsorted_segment_sum(
@@ -369,6 +375,8 @@ def make_hhblits_profile(protein):
   """Compute the HHblits MSA profile if not already present."""
   if 'hhblits_profile' in protein:
     return protein
+  if True:
+    return tf.fast_make_hhblits_profile(protein)
 
   # Compute the profile for every residue (over all MSA sequences).
   protein['hhblits_profile'] = tf.reduce_mean(
@@ -425,7 +433,7 @@ def make_fixed_size(protein, shape_schema, msa_cluster_size, extra_msa_size,
     # Don't transfer this to the accelerator.
     if k == 'extra_cluster_assignment':
       continue
-    shape = v.shape.as_list()
+    shape = list(v.shape)
     schema = shape_schema[k]
     assert len(shape) == len(schema), (
         f'Rank mismatch between shape and shape schema for {k}: '
@@ -437,7 +445,7 @@ def make_fixed_size(protein, shape_schema, msa_cluster_size, extra_msa_size,
     if padding:
       protein[k] = tf.pad(
           v, padding, name=f'pad_to_fixed_{k}')
-      protein[k].set_shape(pad_size)
+      # NumPy tf.pad already return the fixed shape; no set_shape.
 
   return protein
 

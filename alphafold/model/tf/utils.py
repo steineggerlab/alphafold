@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Shared utilities for various components."""
-import tensorflow.compat.v1 as tf
+from alphafold.model.tf import np_backend as tf
 
 
 def tf_combine_mask(*masks):
@@ -32,7 +32,7 @@ class SeedMaker(object):
 
   def __call__(self):
     i = self.next_seed
-    self.next_seed += 1
+    self.next_seed = self.next_seed + 1
     return i
 
 seed_maker = SeedMaker()
