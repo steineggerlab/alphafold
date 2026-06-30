@@ -14,18 +14,21 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+# jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
+_dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
+
 
 def _gdp_kernel(x_ref, wp_ref, bp_ref, wg_ref, bg_ref, mask_ref, o_ref):
   x = x_ref[...]                                      # [BM, K] bf16
-  proj = plgpu.dot(x, wp_ref[...]) + bp_ref[...][None, :].astype(jnp.float32)
-  gate = plgpu.dot(x, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
+  proj = _dot(x, wp_ref[...]) + bp_ref[...][None, :].astype(jnp.float32)
+  gate = _dot(x, wg_ref[...]) + bg_ref[...][None, :].astype(jnp.float32)
   o = mask_ref[...][:, None].astype(jnp.float32) * proj * jax.nn.sigmoid(gate)
   o_ref[...] = o.astype(o_ref.dtype)
 
 
 def _half(x, wp, bp, wg, bg, mask):
-  proj = plgpu.dot(x, wp) + bp[None, :].astype(jnp.float32)
-  gate = plgpu.dot(x, wg) + bg[None, :].astype(jnp.float32)
+  proj = _dot(x, wp) + bp[None, :].astype(jnp.float32)
+  gate = _dot(x, wg) + bg[None, :].astype(jnp.float32)
   return mask[:, None].astype(jnp.float32) * proj * jax.nn.sigmoid(gate)
 
 

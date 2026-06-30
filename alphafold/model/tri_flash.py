@@ -12,6 +12,9 @@ import jax, jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+# jnp.dot is stable across jax versions, contrary to pl.dot/plgpu.dot
+_dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
+
 NEG = -0.7 * float(np.finfo(np.float32).max)
 LOG2E = math.log2(math.e)
 
@@ -35,7 +38,7 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
     kb = (start + jnp.arange(block_k)) < sk        # [block_k] in-bounds keys
     sl = pl.dslice(start, block_k)
     k = plgpu.load(k_ref.at[sl, :], mask=kb[:, None], other=0.0)   # [block_k, D]
-    qk = plgpu.dot(q, k.T)                          # [block_q, block_k]
+    qk = _dot(q, k.T)                          # [block_q, block_k]
     bias = plgpu.load(bias_ref.at[:, sl], mask=kb[None, :], other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
     km = plgpu.load(kmask_ref.at[sl], mask=kb, other=False)  # OOB keys -> masked
@@ -46,7 +49,7 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
     s = jnp.exp2(qk - m_next[:, None])
     l_next = corr * l_prev + s.sum(axis=-1)
     v = plgpu.load(v_ref.at[sl, :], mask=kb[:, None], other=0.0)   # [block_k, D]
-    o_next = corr[:, None] * o_prev + plgpu.dot(s.astype(v.dtype), v)
+    o_next = corr[:, None] * o_prev + _dot(s.astype(v.dtype), v)
     return o_next, m_next, l_next
 
   o, m_i, l_i = jax.lax.fori_loop(0, pl.cdiv(sk, block_k), body, (o, m_i, l_i))
