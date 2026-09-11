@@ -101,10 +101,16 @@ def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale):
   kmask = mask_bias[:, 0, 0, :] > -1e8                          # [b, S_kv] bool
   bias = (jnp.zeros((h, sq, sk), q.dtype)
           if nonbatched_bias is None else nonbatched_bias.astype(q.dtype))
-  # 64x64/4w/2s is optimal across GB10/L40S/H100 (head_dim is only 32, so bigger
-  # tiles waste the SM and are measurably slower).
-  return tri_flash(q, k, v, bias, kmask, sm_scale=float(scale),
-                   block_q=64, block_k=64).astype(q.dtype)
+  # Key tile matches the head: a wider tile stages smem the kernel never reads.
+  block_k = max(16, min(64, c))
+  # Triton's NVIDIA dot needs K >= 16 for 16-bit inputs and Pallas doesn't
+  # check, so head 8 (extra MSA) gave wrong q.k. Zero-padding to 16 is exact.
+  if c < 16:
+    edge = ((0, 0), (0, 0), (0, 0), (0, 16 - c))
+    q, k, v = (jnp.pad(t, edge) for t in (q, k, v))
+  out = tri_flash(q, k, v, bias, kmask, sm_scale=float(scale),
+                  block_q=64, block_k=block_k)
+  return out[..., :c].astype(q.dtype)
 
 
 def ref_attn(q, k, v, bias, kmask, sm_scale):

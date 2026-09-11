@@ -32,6 +32,18 @@ def _half(x, wp, bp, wg, bg, mask):
   return mask[:, None].astype(jnp.float32) * proj * jax.nn.sigmoid(gate)
 
 
+def _gdp_kernel_split_cm(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
+                         wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
+                         ol_ref, or_ref):
+  # _gdp_kernel_split, stored channel-major [ci, BM] for the triangle einsum.
+  x = x_ref[...]
+  m = mask_ref[...]
+  ol_ref[...] = _half(x, wpl_ref[...], bpl_ref[...], wgl_ref[...], bgl_ref[...],
+                      m).T.astype(ol_ref.dtype)
+  or_ref[...] = _half(x, wpr_ref[...], bpr_ref[...], wgr_ref[...], bgr_ref[...],
+                      m).T.astype(or_ref.dtype)
+
+
 def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       wpr_ref, bpr_ref, wgr_ref, bgr_ref, mask_ref,
                       ol_ref, or_ref):
@@ -47,8 +59,9 @@ def _gdp_kernel_split(x_ref, wpl_ref, bpl_ref, wgl_ref, bgl_ref,
                       m).astype(or_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("block_m", "split"))
-def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False):
+@functools.partial(jax.jit, static_argnames=("block_m", "split", "channel_major"))
+def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False,
+                    channel_major=False):
   # x [M,K]; wp/wg [K,P]; bp/bg [P]; mask [M].
   # split=False -> gated [M,P]; split=True -> (left [M,P/2], right [M,P/2]),
   # the two halves written contiguously so the caller needs no slice.
@@ -76,6 +89,16 @@ def gated_dual_proj(x, wp, bp, wg, bg, mask, *, block_m=64, split=False):
     bspec = pl.BlockSpec((ci,), lambda i: (0,))
     split_in = [in_specs[0], wspec, bspec, wspec, bspec, wspec, bspec,
                 wspec, bspec, in_specs[5]]
+    if channel_major:
+      bs = pl.BlockSpec((ci, block_m), lambda i: (0, i))
+      left, right = pl.pallas_call(
+          _gdp_kernel_split_cm,
+          grid=(Mp // block_m,), in_specs=split_in, out_specs=[bs, bs],
+          out_shape=[jax.ShapeDtypeStruct((ci, Mp), x.dtype),
+                     jax.ShapeDtypeStruct((ci, Mp), x.dtype)],
+          compiler_params=cp, name="gated_dual_proj_split_cm",
+      )(x, wpl, bpl, wgl, bgl, wpr, bpr, wgr, bgr, mask)
+      return left[:, :M], right[:, :M]
     bs = pl.BlockSpec((block_m, ci), lambda i: (i, 0))
     left, right = pl.pallas_call(
         _gdp_kernel_split,

@@ -1548,12 +1548,17 @@ class TriangleMultiplication(hk.Module):
       # split=True returns the left/right projections as two contiguous arrays
       # (the [N,N,2ci]->[N,N,ci]x2 split is done in-kernel), so the strided
       # slice copies below are skipped entirely.
+      # [c, i, k] layout, since the einsum batches over c: no input transposes.
       left_p, right_p = gated_dual_proj(
           left_act.reshape(-1, cz), p_w, p_b, g_w, g_b,
-          left_mask.reshape(-1), split=True)
-      left_proj_act = left_p.reshape(n0, n1, ci)
-      right_proj_act = right_p.reshape(n0, n1, ci)
-      act = jnp.einsum(c.equation, left_proj_act, right_proj_act)
+          left_mask.reshape(-1), split=True, channel_major=True)
+      left_proj_act = left_p.reshape(ci, n0, n1)
+      right_proj_act = right_p.reshape(ci, n0, n1)
+      lhs, rhs = c.equation.split('->')[0].split(',')
+      move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
+      equation = f'{move(lhs)},{move(rhs)}->cij'
+      act = jnp.einsum(equation, left_proj_act, right_proj_act)
+      act = jnp.transpose(act, (1, 2, 0))
       act = _layer_norm(axis=-1, name='center_norm')(act)
       output_channel = int(left_act.shape[-1])
       act = common_modules.Linear(
