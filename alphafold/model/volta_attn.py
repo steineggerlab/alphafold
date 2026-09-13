@@ -109,7 +109,9 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
         q, k, v = (jnp.pad(t.astype(jnp.float16), pad) for t in (q, k, v))
     if cc >= 75 and (pad_to or c) == 64 and (block_q, block_k) == (64, 32):
         block_k = 64    # the mma kernel has no (64, 64, 32) instantiation
-    kmask = (mask_bias[:, 0, 0, :] > -1e3).astype(jnp.uint8)
+    # Template pointwise attention shares one mask row across the batch; the kernel
+    # indexes the mask per row, so broadcast instead of reading past its end.
+    kmask = jnp.broadcast_to(mask_bias[:, 0, 0, :] > -1e3, (b, sk)).astype(jnp.uint8)
     bias = (jnp.zeros((h, sq, sk), jnp.float16) if nonbatched_bias is None
             else nonbatched_bias.astype(jnp.float16))
     out = _attn_call(q.astype(jnp.float16), k.astype(jnp.float16),

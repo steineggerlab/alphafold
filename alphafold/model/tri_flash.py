@@ -98,8 +98,9 @@ def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale):
   # True for AF2's attention
   assert q.shape[-1] == v.shape[-1], (
       f'tri_flash needs key_dim == value_dim, got {q.shape[-1]} vs {v.shape[-1]}')
-  # mask_bias is 0 or big_neg(dtype): -1e9, or -1e4 in float16
-  kmask = mask_bias[:, 0, 0, :] > -1e3                          # [b, S_kv] bool
+  # mask_bias is 0 or big_neg(dtype): -1e9, or -1e4 in float16. Template pointwise
+  # attention shares one row across the batch, which the row grid index cannot index.
+  kmask = jnp.broadcast_to(mask_bias[:, 0, 0, :] > -1e3, (b, sk))   # [b, S_kv] bool
   bias = (jnp.zeros((h, sq, sk), q.dtype)
           if nonbatched_bias is None else nonbatched_bias.astype(q.dtype))
   # Key tile matches the head: a wider tile stages smem the kernel never reads.
