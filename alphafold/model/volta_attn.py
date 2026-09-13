@@ -86,7 +86,9 @@ def ops_available(cc):
 @functools.partial(jax.jit, static_argnames=("sym", "sm_scale", "block_q", "block_k"))
 def _attn_call(q, k, v, bias, kmask, *, sym, sm_scale, block_q, block_k):
     n, h, sq, d = q.shape
-    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16))(
+    # sequential: the template stack vmaps over templates, and the handlers take a fixed rank.
+    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16),
+                            vmap_method="sequential")(
         q, k, v, bias, kmask,
         scale=np.float32(sm_scale),
         block_q=np.int64(block_q), block_k=np.int64(block_k))
@@ -123,7 +125,8 @@ def volta_attention(q, k, v, mask_bias, nonbatched_bias, scale, cc,
 def _ln_call(x, scale, offset, *, eps):
     m, c = x.shape
     return jax.ffi.ffi_call(
-        "VoltaLayerNorm", jax.ShapeDtypeStruct((m, c), jnp.float16))(
+        "VoltaLayerNorm", jax.ShapeDtypeStruct((m, c), jnp.float16),
+        vmap_method="sequential")(
             x, scale, offset, eps=np.float32(eps))
 
 
@@ -139,7 +142,8 @@ def volta_layer_norm(x, scale, offset, *, eps=1e-5):
 def _gdp_call(x, wp, bp, wg, bg, mask, *, sym):
     m = x.shape[0]
     n = wp.shape[1]
-    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((m, n), jnp.float16))(
+    return jax.ffi.ffi_call(sym, jax.ShapeDtypeStruct((m, n), jnp.float16),
+                            vmap_method="sequential")(
         x, wp, bp, wg, bg, mask)
 
 
