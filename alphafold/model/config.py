@@ -377,6 +377,9 @@ CONFIG = ml_collections.ConfigDict({
         },
         'global_config': {
             'bfloat16': True,
+            'half_dtype': 'bfloat16',
+            'compute_capability': None,
+            'kernel_backend': 'pallas',  # or 'cuda_legacy'
             'bfloat16_output': False,
             'deterministic': False,
             'multimer_mode': False,
@@ -616,6 +619,9 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
         },
         'global_config': {
             'bfloat16': True,
+            'half_dtype': 'bfloat16',
+            'compute_capability': None,
+            'kernel_backend': 'pallas',  # or 'cuda_legacy'
             'bfloat16_output': False,
             'deterministic': False,
             'multimer_mode': True,

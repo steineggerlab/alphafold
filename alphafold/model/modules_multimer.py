@@ -510,13 +510,13 @@ class EmbeddingsAndEvoformer(hk.Module):
     """
     c = self.config
     gc = self.global_config
-    common_modules.set_use_pallas(gc.get('use_pallas', False))
+    common_modules.set_kernel_context(gc)
     rel_feats = []
     pos = batch['residue_index']
     asym_id = batch['asym_id']
     asym_id_same = jnp.equal(asym_id[:, None], asym_id[None, :])
     offset = pos[:, None] - pos[None, :]
-    dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+    dtype = utils.half_dtype(gc)
 
     clipped_offset = jnp.clip(
         offset + c.max_relative_idx, 0, 2 * c.max_relative_idx)
@@ -568,7 +568,7 @@ class EmbeddingsAndEvoformer(hk.Module):
     gc = self.global_config
 
     batch = dict(batch)
-    dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
+    dtype = utils.half_dtype(gc)
 
     if safe_key is None:
       safe_key = prng.SafeKey(hk.next_rng_key())
@@ -577,7 +577,7 @@ class EmbeddingsAndEvoformer(hk.Module):
 
     batch['msa_profile'] = make_msa_profile(batch)
 
-    with utils.bfloat16_context():
+    with utils.half_context():
       target_feat = jax.nn.one_hot(batch['aatype'], 21).astype(dtype)
 
       preprocess_1d = common_modules.Linear(
@@ -767,7 +767,7 @@ class EmbeddingsAndEvoformer(hk.Module):
     # Convert back to float32 if we're not saving memory.
     if not gc.bfloat16_output:
       for k, v in output.items():
-        if v.dtype == jnp.bfloat16:
+        if v.dtype in (jnp.bfloat16, jnp.float16):
           output[k] = v.astype(jnp.float32)
 
     return output
@@ -931,8 +931,8 @@ class SingleTemplateEmbedding(hk.Module):
       unit_vector = [unit_vector.x, unit_vector.y, unit_vector.z]
 
       if gc.bfloat16:
-        unit_vector = [x.astype(jnp.bfloat16) for x in unit_vector]
-        backbone_mask = backbone_mask.astype(jnp.bfloat16)
+        unit_vector = [x.astype(dtype) for x in unit_vector]
+        backbone_mask = backbone_mask.astype(dtype)
 
       backbone_mask_2d = backbone_mask[:, None] * backbone_mask[None, :]
       backbone_mask_2d *= multichain_mask_2d
@@ -1118,8 +1118,9 @@ def template_embedding_1d(batch, num_channel, global_config):
   template_mask = chi_mask[:, :, 0]
 
   if global_config.bfloat16:
-    template_features = template_features.astype(jnp.bfloat16)
-    template_mask = template_mask.astype(jnp.bfloat16)
+    _dt = utils.half_dtype(global_config)
+    template_features = template_features.astype(_dt)
+    template_mask = template_mask.astype(_dt)
 
   template_activations = common_modules.Linear(
       num_channel,

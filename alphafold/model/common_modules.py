@@ -29,11 +29,16 @@ TRUNCATED_NORMAL_STDDEV_FACTOR = np.asarray(.87962566103423978,
 # to global_config, so the model sets this once (from global_config.use_pallas)
 # at the start of EmbeddingsAndEvoformer, before any LayerNorm is traced.
 _use_pallas = False
+_compute_capability = None
+_kernel_backend = 'pallas'
 
 
-def set_use_pallas(enabled: bool):
-  global _use_pallas
-  _use_pallas = bool(enabled)
+def set_kernel_context(global_config):
+  """LayerNorm has no global_config, so the model sets it once per trace."""
+  global _use_pallas, _compute_capability, _kernel_backend
+  _use_pallas = bool(global_config.get('use_pallas', False))
+  _compute_capability = global_config.get('compute_capability')
+  _kernel_backend = str(global_config.get('kernel_backend', 'pallas'))
 
 
 def get_initializer_scale(initializer_name, input_shape):
@@ -173,16 +178,22 @@ class LayerNorm(hk.LayerNorm):
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     # Fused Pallas layernorm replaces upcast + layernorm + downcast in one kernel
     _last = (self.param_axis is None or tuple(self.param_axis) == (-1,))
-    if (_use_pallas and x.dtype == jnp.bfloat16 and _last
-        and self._temp_create_scale and self._temp_create_offset):
-      from alphafold.model.tri_mul import pallas_layer_norm
-      c = x.shape[-1]
-      scale = hk.get_parameter('scale', (c,), jnp.float32, init=self.scale_init)
-      offset = hk.get_parameter('offset', (c,), jnp.float32, init=self.offset_init)
-      return pallas_layer_norm(x, scale, offset, eps=self.eps)
+    if (_last and self._temp_create_scale and self._temp_create_offset
+        and x.dtype in (jnp.bfloat16, jnp.float16)):
+      from alphafold.model import fused_ops
+      _fused = fused_ops.layer_norm(
+          {'use_pallas': _use_pallas, 'compute_capability': _compute_capability,
+           'kernel_backend': _kernel_backend}, x.dtype)
+      if _fused is not None:
+        c = x.shape[-1]
+        scale = hk.get_parameter('scale', (c,), jnp.float32, init=self.scale_init)
+        offset = hk.get_parameter('offset', (c,), jnp.float32, init=self.offset_init)
+        return _fused(x, scale, offset, eps=self.eps)
 
-    is_bf16 = (x.dtype == jnp.bfloat16)
-    if is_bf16:
+    # Normalise in fp32 and cast back; fp16 variance overflows otherwise.
+    _in_dtype = x.dtype
+    is_half = _in_dtype in (jnp.bfloat16, jnp.float16)
+    if is_half:
       x = x.astype(jnp.float32)
 
     param_axis = self.param_axis[0] if self.param_axis else -1
@@ -204,8 +215,8 @@ class LayerNorm(hk.LayerNorm):
 
     out = super().__call__(x, scale=scale, offset=offset)
 
-    if is_bf16:
-      out = out.astype(jnp.bfloat16)
+    if is_half:
+      out = out.astype(_in_dtype)
 
     return out
   

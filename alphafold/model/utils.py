@@ -26,6 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 
 
+from alphafold.model.half_precision import *  # noqa: F401,F403  (utils.<helper>)
+
+
 def bfloat16_creator(next_creator, shape, dtype, init, context):
   """Creates float32 variables when bfloat16 is requested."""
   if context.original_dtype == jnp.bfloat16:
@@ -88,6 +91,11 @@ def mask_mean(mask, value, axis=None, drop_mask_channel=False, eps=1e-10):
     else:
       assert mask_size == value_size
 
+  # eps=1e-10 is 0 in fp16, so a fully masked slice gives NaN; accumulate in fp32.
+  if jnp.dtype(value.dtype) == jnp.dtype(jnp.float16):
+    num = jnp.sum(mask * value, axis=axis, dtype=jnp.float32)
+    den = jnp.sum(mask, axis=axis, dtype=jnp.float32) * broadcast_factor + eps
+    return (num / den).astype(value.dtype)
   return (jnp.sum(mask * value, axis=axis) /
           (jnp.sum(mask, axis=axis) * broadcast_factor + eps))
 

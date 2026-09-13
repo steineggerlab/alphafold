@@ -24,6 +24,7 @@ from alphafold.model import folding
 from alphafold.model import layer_stack
 from alphafold.model import lddt
 from alphafold.model import mapping
+from alphafold.model import fused_ops
 from alphafold.model import prng
 from alphafold.model import quat_affine
 from alphafold.model import utils
@@ -560,24 +561,6 @@ class TemplatePairStack(hk.Module):
     return pair_act
 
 
-# Transitions aren't quadratic: chunk to a ~256 MiB intermediate, not 4 rows.
-# Only with fused kernels, where the launch count was measured: on plain XLA the
-# wider chunk makes it pick fusions that want more shared memory than RDNA has.
-_TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
-
-
-def _transition_subbatch(global_config, shape, num_intermediate, dtype):
-  configured = global_config.subbatch_size
-  if configured is None or not global_config.get('use_pallas', False):
-    return configured
-  per_row = num_intermediate * jnp.dtype(dtype).itemsize
-  for dim in shape[1:-1]:
-    per_row *= int(dim)
-  if per_row <= 0:
-    return configured
-  return max(configured, min(shape[0], _TRANSITION_BUDGET_BYTES // per_row))
-
-
 class Transition(hk.Module):
   """Transition layer.
 
@@ -626,8 +609,8 @@ class Transition(hk.Module):
 
     act = mapping.inference_subbatch(
         transition_module,
-        _transition_subbatch(self.global_config, act.shape,
-                             num_intermediate, act.dtype),
+        fused_ops.transition_subbatch(self.global_config, act.shape,
+                                      num_intermediate, act.dtype),
         batched_args=[act],
         nonbatched_args=[],
         low_memory=not is_training)
@@ -688,9 +671,9 @@ class Attention(hk.Module):
 
     # Pallas/Triton flash-attention kernel replaces score+softmax+value
     # without materializing the [N_q, N_k] matrix
-    if (self.global_config.get('use_pallas', False)
-        and q_data.dtype in (jnp.bfloat16, jnp.float16)):
-      from alphafold.model.tri_flash import pallas_attention
+    pallas_attention = fused_ops.attention(
+        self.global_config, q_data.dtype, key_dim, value_dim)
+    if pallas_attention is not None:
       q = jnp.einsum('bqa,ahc->bhqc', q_data, q_weights)
       k = jnp.einsum('bka,ahc->bhkc', m_data, k_weights)
       v = jnp.einsum('bka,ahc->bhkc', m_data, v_weights)
@@ -735,7 +718,8 @@ class Attention(hk.Module):
     if nonbatched_bias is not None:
       logits += jnp.expand_dims(nonbatched_bias, axis=0)
     # fix NaN's in jax >= 0.4, different fix than in AF2
-    logits = jnp.clip(logits, -1e8, 1e8)
+    _clip = utils.logit_clip(logits.dtype)
+    logits = jnp.clip(logits, -_clip, _clip)
     weights = jax.nn.softmax(logits)
     weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
@@ -833,10 +817,11 @@ class GlobalAttention(hk.Module):
 
     q = jnp.einsum('ba,ahc->bhc', q_avg, q_weights) * key_dim**(-0.5)
     k = jnp.einsum('bka,ac->bkc', m_data, k_weights)
-    bias = (1e9 * (q_mask[:, None, :, 0] - 1.))
+    bias = utils.mask_to_bias(q_mask[:, None, :, 0], q_data.dtype)
     logits = jnp.einsum('bhc,bkc->bhk', q, k) + bias
     # fix NaN's in jax >= 0.4, different fix than in AF2
-    logits = jnp.clip(logits, -1e8, 1e8)
+    _clip = utils.logit_clip(logits.dtype)
+    logits = jnp.clip(logits, -_clip, _clip)
     weights = jax.nn.softmax(logits)
     weighted_avg = jnp.einsum('bhk,bkc->bhc', weights, v)
 
@@ -910,7 +895,7 @@ class MSARowAttentionWithPairBias(hk.Module):
     assert len(msa_mask.shape) == 2
     assert c.orientation == 'per_row'
 
-    bias = (1e9 * (msa_mask - 1.))[:, None, None, :]
+    bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
     msa_act = common_modules.LayerNorm(
@@ -934,7 +919,7 @@ class MSARowAttentionWithPairBias(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    if self.global_config.get('use_pallas', False):
+    if fused_ops.attention_fused(self.global_config, c, msa_act):
       # Pallas flash attention doesn't materialize the [N,N] matrix
       # memory-saving subbatch chunking is unneeded
       msa_act = attn_mod(msa_act, msa_act, bias, nonbatched_bias)
@@ -983,7 +968,7 @@ class MSAColumnAttention(hk.Module):
     msa_act = jnp.swapaxes(msa_act, -2, -3)
     msa_mask = jnp.swapaxes(msa_mask, -1, -2)
 
-    bias = (1e9 * (msa_mask - 1.))[:, None, None, :]
+    bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
     msa_act = common_modules.LayerNorm(
@@ -992,7 +977,7 @@ class MSAColumnAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    if self.global_config.get('use_pallas', False):
+    if fused_ops.attention_fused(self.global_config, c, msa_act):
       msa_act = attn_mod(msa_act, msa_act, bias)
     else:
       msa_act = mapping.inference_subbatch(
@@ -1041,7 +1026,7 @@ class MSAColumnGlobalAttention(hk.Module):
     msa_act = jnp.swapaxes(msa_act, -2, -3)
     msa_mask = jnp.swapaxes(msa_mask, -1, -2)
 
-    bias = (1e9 * (msa_mask - 1.))[:, None, None, :]
+    bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
     msa_act = common_modules.LayerNorm(
@@ -1098,7 +1083,7 @@ class TriangleAttention(hk.Module):
       pair_act = jnp.swapaxes(pair_act, -2, -3)
       pair_mask = jnp.swapaxes(pair_mask, -1, -2)
 
-    bias = (1e9 * (pair_mask - 1.))[:, None, None, :]
+    bias = utils.mask_to_bias(pair_mask, pair_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
     pair_act = common_modules.LayerNorm(
@@ -1115,7 +1100,7 @@ class TriangleAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, pair_act.shape[-1])
-    if self.global_config.get('use_pallas', False):
+    if fused_ops.attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
       pair_act = mapping.inference_subbatch(
@@ -1514,7 +1499,8 @@ class TriangleMultiplication(hk.Module):
     # For the "outgoing" edges, a = left_proj_act and b = right_proj_act
     # For the "incoming" edges, it's swapped:
     #   b = left_proj_act and a = right_proj_act
-    act = jnp.einsum(c.equation, left_proj_act, right_proj_act)
+    # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+    act = utils.wide_einsum(c.equation, left_proj_act, right_proj_act)
 
     act = common_modules.LayerNorm(
         axis=[-1],
@@ -1522,6 +1508,7 @@ class TriangleMultiplication(hk.Module):
         create_offset=True,
         name='center_layer_norm')(
             act)
+    act = utils.to_half_like(act, left_proj_act)
 
     output_channel = int(input_act.shape[-1])
 
@@ -1548,10 +1535,8 @@ class TriangleMultiplication(hk.Module):
 
     left_act = _layer_norm(axis=-1, name='left_norm_input')(left_act)
 
-    if (gc.get('use_pallas', False)
-        and left_act.dtype in (jnp.bfloat16, jnp.float16)):
-      # Pallas fused masked sigmoid-gated dual projection
-      from alphafold.model.tri_mul import gated_dual_proj
+    gated_dual_proj = fused_ops.gated_dual_proj(gc, left_act.dtype)
+    if gated_dual_proj is not None:
       ci = c.num_intermediate_channel
       cz = left_act.shape[-1]
       n0, n1 = left_act.shape[0], left_act.shape[1]
@@ -1576,9 +1561,11 @@ class TriangleMultiplication(hk.Module):
       lhs, rhs = c.equation.split('->')[0].split(',')
       move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
       equation = f'{move(lhs)},{move(rhs)}->cij'
-      act = jnp.einsum(equation, left_proj_act, right_proj_act)
+      # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+      act = utils.wide_einsum(equation, left_proj_act, right_proj_act)
       act = jnp.transpose(act, (1, 2, 0))
       act = _layer_norm(axis=-1, name='center_norm')(act)
+      act = utils.to_half_like(act, left_proj_act)
       output_channel = int(left_act.shape[-1])
       act = common_modules.Linear(
           output_channel, initializer=utils.final_init(gc),
@@ -1604,9 +1591,11 @@ class TriangleMultiplication(hk.Module):
 
     left_proj_act = proj_act[:, :, :c.num_intermediate_channel]
     right_proj_act = proj_act[:, :, c.num_intermediate_channel:]
-    act = jnp.einsum(c.equation, left_proj_act, right_proj_act)
+    # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+    act = utils.wide_einsum(c.equation, left_proj_act, right_proj_act)
 
     act = _layer_norm(axis=-1, name='center_norm')(act)
+    act = utils.to_half_like(act, left_proj_act)
 
     output_channel = int(left_act.shape[-1])
 
@@ -1759,6 +1748,8 @@ class OuterProductMean(hk.Module):
         dtype=act.dtype,
         init=hk.initializers.Constant(0.0))
 
+    _ref = act
+
     def compute_chunk(left_act):
       # This is equivalent to
       #
@@ -1767,8 +1758,9 @@ class OuterProductMean(hk.Module):
       #
       # but faster.
       left_act = jnp.transpose(left_act, [0, 2, 1])
-      act = jnp.einsum('acb,ade->dceb', left_act, right_act)
-      act = jnp.einsum('dceb,cef->dbf', act, output_w) + output_b
+      # Contracts over MSA depth, which overflows fp16.
+      act = utils.wide_einsum('acb,ade->dceb', left_act, right_act)
+      act = utils.wide_einsum('dceb,cef->dbf', act, output_w) + output_b
       return jnp.transpose(act, [1, 0, 2])
 
     act = mapping.inference_subbatch(
@@ -1781,8 +1773,9 @@ class OuterProductMean(hk.Module):
         output_subbatch_dim=0)
 
     epsilon = 1e-3
-    norm = jnp.einsum('abc,adc->bdc', mask, mask)
+    norm = utils.wide_einsum('abc,adc->bdc', mask, mask)
     act /= epsilon + norm
+    act = act.astype(_ref.dtype)
 
     return act
 
@@ -1985,13 +1978,13 @@ class EmbeddingsAndEvoformer(hk.Module):
 
     c = self.config
     gc = self.global_config
-    dtype = jnp.bfloat16 if gc.bfloat16 else jnp.float32
-    common_modules.set_use_pallas(gc.get('use_pallas', False))
+    dtype = utils.half_dtype(gc)
+    common_modules.set_kernel_context(gc)
 
     if safe_key is None:
       safe_key = prng.SafeKey(hk.next_rng_key())
 
-    with utils.bfloat16_context():
+    with utils.half_context():
       # Embed clustered MSA.
       # Jumper et al. (2021) Suppl. Alg. 2 "Inference" line 5
       # Jumper et al. (2021) Suppl. Alg. 3 "InputEmbedder"
@@ -2202,7 +2195,7 @@ class EmbeddingsAndEvoformer(hk.Module):
     # Convert back to float32 if we're not saving memory.
     if not gc.bfloat16_output:
       for k, v in output.items():
-        if v.dtype == jnp.bfloat16:
+        if v.dtype in (jnp.bfloat16, jnp.float16):
           output[k] = v.astype(jnp.float32)
 
     return output
@@ -2372,7 +2365,7 @@ class TemplateEmbedding(hk.Module):
         jnp.transpose(template_pair_representation, [1, 2, 0, 3]),
         [num_res * num_res, num_templates, num_channels])
 
-    bias = (1e9 * (template_mask[None, None, None, :] - 1.))
+    bias = utils.mask_to_bias(template_mask[None, None, None, :], query_embedding.dtype)
 
     template_pointwise_attention_module = Attention(
         self.config.attention, self.global_config, query_num_channels)
