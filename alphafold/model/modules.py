@@ -560,6 +560,24 @@ class TemplatePairStack(hk.Module):
     return pair_act
 
 
+# Transitions aren't quadratic: chunk to a ~256 MiB intermediate, not 4 rows.
+# Only with fused kernels, where the launch count was measured: on plain XLA the
+# wider chunk makes it pick fusions that want more shared memory than RDNA has.
+_TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def _transition_subbatch(global_config, shape, num_intermediate, dtype):
+  configured = global_config.subbatch_size
+  if configured is None or not global_config.get('use_pallas', False):
+    return configured
+  per_row = num_intermediate * jnp.dtype(dtype).itemsize
+  for dim in shape[1:-1]:
+    per_row *= int(dim)
+  if per_row <= 0:
+    return configured
+  return max(configured, min(shape[0], _TRANSITION_BUDGET_BYTES // per_row))
+
+
 class Transition(hk.Module):
   """Transition layer.
 
@@ -608,7 +626,8 @@ class Transition(hk.Module):
 
     act = mapping.inference_subbatch(
         transition_module,
-        self.global_config.subbatch_size,
+        _transition_subbatch(self.global_config, act.shape,
+                             num_intermediate, act.dtype),
         batched_args=[act],
         nonbatched_args=[],
         low_memory=not is_training)
