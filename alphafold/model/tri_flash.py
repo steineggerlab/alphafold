@@ -27,7 +27,12 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
   # jnp.pad copy of q/k/v is needed.
   D = q_ref.shape[-1]
   sk = k_ref.shape[0]
-  q = q_ref[...]                                   # [block_q, D]
+  # Triton's dot needs K >= 16 for 16-bit inputs; widen the q and k tiles here so that
+  # q/k/v need no padded copy in global memory.
+  dk = max(16, D)
+  dcols = jnp.arange(dk) < D
+  q = (plgpu.load(q_ref.at[:, pl.dslice(0, dk)], mask=dcols[None, :], other=0.0)
+       if D < 16 else q_ref[...])                  # [block_q, dk]
   m_i = jnp.full(block_q, -float('inf'), jnp.float32)
   l_i = jnp.zeros(block_q, jnp.float32)
   o = jnp.zeros((block_q, D), jnp.float32)
@@ -37,7 +42,8 @@ def _kernel(q_ref, k_ref, v_ref, bias_ref, kmask_ref, o_ref, *,
     start = j * block_k
     kb = (start + jnp.arange(block_k)) < sk        # [block_k] in-bounds keys
     sl = pl.dslice(start, block_k)
-    k = plgpu.load(k_ref.at[sl, :], mask=kb[:, None], other=0.0)   # [block_k, D]
+    k = plgpu.load(k_ref.at[sl, pl.dslice(0, dk)],
+                   mask=kb[:, None] & dcols[None, :], other=0.0)   # [block_k, dk]
     qk = _dot(q, k.T)                          # [block_q, block_k]
     bias = plgpu.load(bias_ref.at[:, sl], mask=kb[None, :], other=0.0)
     qk = (qk * sm_scale + bias) * LOG2E
@@ -105,14 +111,10 @@ def pallas_attention(q, k, v, mask_bias, nonbatched_bias, scale):
           if nonbatched_bias is None else nonbatched_bias.astype(q.dtype))
   # Key tile matches the head: a wider tile stages smem the kernel never reads.
   block_k = max(16, min(64, c))
-  # Triton's NVIDIA dot needs K >= 16 for 16-bit inputs and Pallas doesn't
-  # check, so head 8 (extra MSA) gave wrong q.k. Zero-padding to 16 is exact.
-  if c < 16:
-    edge = ((0, 0), (0, 0), (0, 0), (0, 16 - c))
-    q, k, v = (jnp.pad(t, edge) for t in (q, k, v))
+  # head 8 needs K >= 16 for Triton's dot; the kernel widens the tiles itself.
   out = tri_flash(q, k, v, bias, kmask, sm_scale=float(scale),
                   block_q=64, block_k=block_k)
-  return out[..., :c].astype(q.dtype)
+  return out.astype(q.dtype)
 
 
 def ref_attn(q, k, v, bias, kmask, sm_scale):
