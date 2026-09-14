@@ -9,7 +9,7 @@ import numpy as np
 
 # Head dims each kernel instantiates: mma.sync (sm_75+) and wmma (sm_70).
 _HEAD_DIMS_MMA = (8, 16, 32, 64)
-_HEAD_DIMS_WMMA = (16, 32, 64)
+_HEAD_DIMS_WMMA = (8, 16, 32, 64)
 
 _LOADED = {}
 
