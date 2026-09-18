@@ -24,13 +24,39 @@ from alphafold.model import folding
 from alphafold.model import layer_stack
 from alphafold.model import lddt
 from alphafold.model import mapping
-from alphafold.model import fused_ops
+from colabfold_kernels import fused_ops
 from alphafold.model import prng
 from alphafold.model import quat_affine
 from alphafold.model import utils
 import haiku as hk
 import jax
 import jax.numpy as jnp
+
+# Transitions aren't quadratic: chunk to a ~256 MiB intermediate, not 4 rows.
+# Only with fused kernels, where the launch count was measured: on plain XLA the
+# wider chunk makes it pick fusions that want more shared memory than RDNA has.
+_TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def transition_subbatch(global_config, shape, num_intermediate, dtype):
+  """Subbatch that keeps a transition's intermediate near the budget."""
+  configured = global_config.subbatch_size
+  if configured is None or not global_config.get('use_pallas', False):
+    return configured
+  per_row = num_intermediate * jnp.dtype(dtype).itemsize
+  for dim in shape[1:-1]:
+    per_row *= int(dim)
+  if per_row <= 0:
+    return configured
+  return max(configured, min(shape[0], _TRANSITION_BUDGET_BYTES // per_row))
+
+
+def attention_fused(global_config, config, act):
+  """True if Attention(config) on `act` runs a fused kernel (no subbatching)."""
+  key_dim = config.get('key_dim', int(act.shape[-1])) // config.num_head
+  value_dim = config.get('value_dim', int(act.shape[-1])) // config.num_head
+  return fused_ops.attention(global_config, act.dtype, key_dim, value_dim) is not None
+
 
 def softmax_cross_entropy(logits, labels):
   """Computes softmax cross entropy given logits and one-hot class labels."""
@@ -609,8 +635,8 @@ class Transition(hk.Module):
 
     act = mapping.inference_subbatch(
         transition_module,
-        fused_ops.transition_subbatch(self.global_config, act.shape,
-                                      num_intermediate, act.dtype),
+        transition_subbatch(self.global_config, act.shape,
+                            num_intermediate, act.dtype),
         batched_args=[act],
         nonbatched_args=[],
         low_memory=not is_training)
@@ -919,7 +945,7 @@ class MSARowAttentionWithPairBias(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    if fused_ops.attention_fused(self.global_config, c, msa_act):
+    if attention_fused(self.global_config, c, msa_act):
       # Pallas flash attention doesn't materialize the [N,N] matrix
       # memory-saving subbatch chunking is unneeded
       msa_act = attn_mod(msa_act, msa_act, bias, nonbatched_bias)
@@ -977,7 +1003,7 @@ class MSAColumnAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
-    if fused_ops.attention_fused(self.global_config, c, msa_act):
+    if attention_fused(self.global_config, c, msa_act):
       msa_act = attn_mod(msa_act, msa_act, bias)
     else:
       msa_act = mapping.inference_subbatch(
@@ -1100,7 +1126,7 @@ class TriangleAttention(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, pair_act.shape[-1])
-    if fused_ops.attention_fused(self.global_config, c, pair_act):
+    if attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
       pair_act = mapping.inference_subbatch(

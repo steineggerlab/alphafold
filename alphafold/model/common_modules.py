@@ -180,7 +180,7 @@ class LayerNorm(hk.LayerNorm):
     _last = (self.param_axis is None or tuple(self.param_axis) == (-1,))
     if (_last and self._temp_create_scale and self._temp_create_offset
         and x.dtype in (jnp.bfloat16, jnp.float16)):
-      from alphafold.model import fused_ops
+      from colabfold_kernels import fused_ops
       _fused = fused_ops.layer_norm(
           {'use_pallas': _use_pallas, 'compute_capability': _compute_capability,
            'kernel_backend': _kernel_backend}, x.dtype)
