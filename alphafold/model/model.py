@@ -165,10 +165,15 @@ class RunModel:
     # Make sure state and feature are converted on GPU
     feat = jax.device_put(feat)
     prev = jax.device_put(prev)
-    half = lambda x: jax.tree_util.tree_map(lambda v: jnp.asarray(v, jnp.float16), x)
+
+    # keep coordinates in fp32 to keep backbone bond precision
+    coords = jax.tree_util.DictKey("final_atom_positions")
+    def cast(path, v):
+      return jnp.asarray(v, jnp.float32 if path[-1] == coords else jnp.float16)
 
     def run(key, feat, prev):
-      result = half(self.apply(self.params, key, {**feat, "prev": prev}))
+      result = jax.tree_util.tree_map_with_path(
+          cast, self.apply(self.params, key, {**feat, "prev": prev}))
       prev = result.pop("prev")
       return jax.device_get(result), prev
 
