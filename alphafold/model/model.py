@@ -162,17 +162,15 @@ class RunModel:
     else:
       prev["prev_pos"] = zeros([L,37,3])
     
+    # Make sure state and feature are converted on GPU
+    feat = jax.device_put(feat)
+    prev = jax.device_put(prev)
+    half = lambda x: jax.tree_util.tree_map(lambda v: jnp.asarray(v, jnp.float16), x)
+
     def run(key, feat, prev):
-      def _jnp_to_np(x):
-        for k, v in x.items():
-          if isinstance(v, dict):
-            x[k] = _jnp_to_np(v)
-          else:
-            x[k] = np.asarray(v,np.float16)
-        return x
-      result = _jnp_to_np(self.apply(self.params, key, {**feat, "prev":prev}))
+      result = half(self.apply(self.params, key, {**feat, "prev": prev}))
       prev = result.pop("prev")
-      return result, prev
+      return jax.device_get(result), prev
 
 
     # initialize random key
@@ -194,8 +192,8 @@ class RunModel:
         
         if return_representations:
 
-          result["representations"] = {"pair":   prev["prev_pair"],
-                                       "single": prev["prev_msa_first_row"]}
+          result["representations"] = {"pair":   np.asarray(prev["prev_pair"]),
+                                       "single": np.asarray(prev["prev_msa_first_row"])}
                                        
         # callback
         if callback is not None: callback(result, r)
