@@ -96,11 +96,16 @@ def dropout_wrapper(module,
     output_act = input_act
 
   gc = global_config
-  residual = module(input_act, mask, is_training=is_training, **kwargs)
   dropout_rate = 0.0 if gc.deterministic else module.config.dropout_rate
 
   # Will override `is_training` to True if want to use dropout.
   should_apply_dropout = True if gc.eval_dropout else is_training
+
+  # Without dropout, a module that takes the residual adds it inside its last kernel.
+  if getattr(module, 'takes_residual', False) and not (should_apply_dropout and dropout_rate):
+    return module(input_act, mask, is_training=is_training, residual=output_act, **kwargs)
+
+  residual = module(input_act, mask, is_training=is_training, **kwargs)
 
   if module.config.shared_dropout:
     if module.config.orientation == 'per_row':
@@ -587,6 +592,21 @@ class TemplatePairStack(hk.Module):
     return pair_act
 
 
+def _linear_params(scope, fan_in, fan_out, dtype, initializer, bias_init=0.):
+  """weights and bias as common_modules.Linear(name=scope) creates them."""
+  with hk.experimental.name_scope(scope):
+    return (hk.get_parameter('weights', (fan_in, fan_out), dtype,
+                             common_modules.get_initializer_scale(initializer, (fan_in,))),
+            hk.get_parameter('bias', (fan_out,), dtype, hk.initializers.Constant(bias_init)))
+
+
+def _layer_norm_params(scope, channels):
+  """scale and offset as the fused common_modules.LayerNorm(name=scope) creates them."""
+  with hk.experimental.name_scope(scope):
+    return (hk.get_parameter('scale', (channels,), jnp.float32, hk.initializers.Constant(1.)),
+            hk.get_parameter('offset', (channels,), jnp.float32, hk.initializers.Constant(0.)))
+
+
 class Transition(hk.Module):
   """Transition layer.
 
@@ -599,7 +619,9 @@ class Transition(hk.Module):
     self.config = config
     self.global_config = global_config
 
-  def __call__(self, act, mask, is_training=True):
+  takes_residual = True
+
+  def __call__(self, act, mask, is_training=True, residual=None):
     """Builds Transition module.
 
     Arguments:
@@ -614,6 +636,18 @@ class Transition(hk.Module):
 
     num_intermediate = int(nc * self.config.num_intermediate_factor)
     mask = jnp.expand_dims(mask, axis=-1)
+
+    fused = fused_ops.transition(self.global_config, act.dtype, nc, num_intermediate)
+    if fused is not None:
+      # One kernel: the [.., num_intermediate] hidden activation stays on chip.
+      ln = _layer_norm_params('input_layer_norm', nc)
+      t1 = _linear_params('transition1', nc, num_intermediate, act.dtype, 'relu')
+      t2 = _linear_params('transition2', num_intermediate, nc, act.dtype,
+                          utils.final_init(self.global_config))
+      if residual is act:
+        return fused(act, *ln, *t1, *t2, add_input=True)
+      out = fused(act, *ln, *t1, *t2)
+      return out if residual is None else residual + out
 
     act = common_modules.LayerNorm(
         axis=[-1],
@@ -641,7 +675,7 @@ class Transition(hk.Module):
         nonbatched_args=[],
         low_memory=not is_training)
 
-    return act
+    return act if residual is None else residual + act
 
 
 def glorot_uniform():
@@ -659,6 +693,49 @@ class Attention(hk.Module):
     self.config = config
     self.global_config = global_config
     self.output_dim = output_dim
+
+  def packed_kernel(self, act):
+    """The packed-projection kernel for self-attention on act, or None."""
+    num_head = self.config.num_head
+    key_dim = self.config.get('key_dim', int(act.shape[-1])) // num_head
+    value_dim = self.config.get('value_dim', int(act.shape[-1])) // num_head
+    return fused_ops.packed_attention(self.global_config, act.dtype, key_dim, value_dim)
+
+  def packed(self, act, mask, nonbatched_bias=None, column=False):
+    """Self-attention over the rows of act [X, Y, a], or its columns when column.
+
+    One GEMM projects q/k/v/gate, which the kernel reads in place: no transposes.
+    mask is [X, Y]; nonbatched_bias [h, S, S] for the attended axis S.
+    """
+    X, Y, a = act.shape
+    num_head = self.config.num_head
+    key_dim = self.config.get('key_dim', a) // num_head
+    value_dim = self.config.get('value_dim', a) // num_head
+    w = [hk.get_parameter(n, shape=(a, num_head, d), dtype=act.dtype, init=glorot_uniform())
+         for n, d in (('query_w', key_dim), ('key_w', key_dim), ('value_w', value_dim))]
+    gate_bias = None
+    if self.config.gating:
+      w.append(hk.get_parameter('gating_w', shape=(a, num_head, value_dim), dtype=act.dtype,
+                                init=hk.initializers.Constant(0.0)))
+      gate_bias = hk.get_parameter('gating_b', shape=(num_head, value_dim), dtype=act.dtype,
+                                   init=hk.initializers.Constant(1.0))
+    w = jnp.stack(w, axis=1).reshape(a, -1)
+    p = jnp.dot(act.reshape(-1, a), w).reshape(X, Y, -1, num_head, key_dim)
+    if column:
+      mask = mask.T
+    s = mask.shape[1]
+    kmask = utils.mask_to_bias(mask, act.dtype) > -1e3
+    if nonbatched_bias is None:
+      nonbatched_bias = jnp.zeros((num_head, s, s), act.dtype)
+    out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias,
+                                  sm_scale=key_dim**(-0.5), column=column)
+    o_init = hk.initializers.Constant(0.0) if self.global_config.zero_init else glorot_uniform()
+    o_weights = hk.get_parameter('output_w', shape=(num_head, value_dim, self.output_dim),
+                                 dtype=act.dtype, init=o_init)
+    o_bias = hk.get_parameter('output_b', shape=(self.output_dim,), dtype=act.dtype,
+                              init=hk.initializers.Constant(0.0))
+    out = jnp.dot(out.reshape(X * Y, -1), o_weights.reshape(-1, self.output_dim)) + o_bias
+    return out.reshape(X, Y, self.output_dim)
 
   def __call__(self, q_data, m_data, bias, nonbatched_bias=None):
     """Builds Attention module.
@@ -945,6 +1022,8 @@ class MSARowAttentionWithPairBias(hk.Module):
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
+    if attn_mod.packed_kernel(msa_act) is not None:
+      return attn_mod.packed(msa_act, msa_mask, nonbatched_bias)
     if attention_fused(self.global_config, c, msa_act):
       # Pallas flash attention doesn't materialize the [N,N] matrix
       # memory-saving subbatch chunking is unneeded
@@ -991,8 +1070,12 @@ class MSAColumnAttention(hk.Module):
     assert len(msa_mask.shape) == 2
     assert c.orientation == 'per_column'
 
-    msa_act = jnp.swapaxes(msa_act, -2, -3)
-    msa_mask = jnp.swapaxes(msa_mask, -1, -2)
+    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
+    # The packed kernel attends down the columns in place, so it needs no transposed copies.
+    packed = attn_mod.packed_kernel(msa_act) is not None
+    if not packed:
+      msa_act = jnp.swapaxes(msa_act, -2, -3)
+      msa_mask = jnp.swapaxes(msa_mask, -1, -2)
 
     bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
@@ -1001,8 +1084,8 @@ class MSAColumnAttention(hk.Module):
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
             msa_act)
 
-    attn_mod = Attention(
-        c, self.global_config, msa_act.shape[-1])
+    if packed:
+      return attn_mod.packed(msa_act, msa_mask, column=True)
     if attention_fused(self.global_config, c, msa_act):
       msa_act = attn_mod(msa_act, msa_act, bias)
     else:
@@ -1105,7 +1188,11 @@ class TriangleAttention(hk.Module):
     assert len(pair_mask.shape) == 2
     assert c.orientation in ['per_row', 'per_column']
 
-    if c.orientation == 'per_column':
+    attn_mod = Attention(c, self.global_config, pair_act.shape[-1])
+    # The packed kernel attends along either axis in place, so it needs no transposed copies.
+    packed = attn_mod.packed_kernel(pair_act) is not None
+    column = c.orientation == 'per_column'
+    if column and not packed:
       pair_act = jnp.swapaxes(pair_act, -2, -3)
       pair_mask = jnp.swapaxes(pair_mask, -1, -2)
 
@@ -1122,10 +1209,10 @@ class TriangleAttention(hk.Module):
         shape=(pair_act.shape[-1], c.num_head),
         dtype=pair_act.dtype,
         init=hk.initializers.RandomNormal(stddev=init_factor))
-    nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
+    nonbatched_bias = jnp.einsum('kqc,ch->hqk' if column and packed else 'qkc,ch->hqk', pair_act, weights)
 
-    attn_mod = Attention(
-        c, self.global_config, pair_act.shape[-1])
+    if packed:
+      return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column)
     if attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
@@ -1136,7 +1223,7 @@ class TriangleAttention(hk.Module):
           nonbatched_args=[nonbatched_bias],
           low_memory=not is_training)
 
-    if c.orientation == 'per_column':
+    if column:
       pair_act = jnp.swapaxes(pair_act, -2, -3)
 
     return pair_act
@@ -1464,7 +1551,9 @@ class TriangleMultiplication(hk.Module):
     self.config = config
     self.global_config = global_config
 
-  def __call__(self, left_act, left_mask, is_training=True):
+  takes_residual = True
+
+  def __call__(self, left_act, left_mask, is_training=True, residual=None):
     """Builds TriangleMultiplication module.
 
     Arguments:
@@ -1478,9 +1567,10 @@ class TriangleMultiplication(hk.Module):
     del is_training
 
     if self.config.fuse_projection_weights:
-      return self._fused_triangle_multiplication(left_act, left_mask)
+      return self._fused_triangle_multiplication(left_act, left_mask, residual)
     else:
-      return self._triangle_multiplication(left_act, left_mask)
+      act = self._triangle_multiplication(left_act, left_mask)
+      return act if residual is None else residual + act
 
   @hk.transparent
   def _triangle_multiplication(self, left_act, left_mask):
@@ -1553,7 +1643,7 @@ class TriangleMultiplication(hk.Module):
     return act
 
   @hk.transparent
-  def _fused_triangle_multiplication(self, left_act, left_mask):
+  def _fused_triangle_multiplication(self, left_act, left_mask, residual=None):
     """TriangleMultiplication with fused projection weights."""
     mask = left_mask[..., None]
     c = self.config
@@ -1566,15 +1656,8 @@ class TriangleMultiplication(hk.Module):
       ci = c.num_intermediate_channel
       cz = left_act.shape[-1]
       n0, n1 = left_act.shape[0], left_act.shape[1]
-      def _proj_w(name):
-        with hk.experimental.name_scope(name):
-          w = hk.get_parameter('weights', (cz, 2 * ci), left_act.dtype,
-                               init=hk.initializers.TruncatedNormal())
-          b = hk.get_parameter('bias', (2 * ci,), left_act.dtype,
-                               init=hk.initializers.Constant(0.))
-        return w, b
-      p_w, p_b = _proj_w('projection')
-      g_w, g_b = _proj_w('gate')
+      p_w, p_b = _linear_params('projection', cz, 2 * ci, left_act.dtype, 'linear')
+      g_w, g_b = _linear_params('gate', cz, 2 * ci, left_act.dtype, utils.final_init(gc), bias_init=1.)
       # split=True returns the left/right projections as two contiguous arrays
       # (the [N,N,2ci]->[N,N,ci]x2 split is done in-kernel), so the strided
       # slice copies below are skipped entirely.
@@ -1589,6 +1672,17 @@ class TriangleMultiplication(hk.Module):
       equation = f'{move(lhs)},{move(rhs)}->cij'
       # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
       act = utils.wide_einsum(equation, left_proj_act, right_proj_act)
+      epilogue = fused_ops.trimul_epilogue(gc, left_act.dtype)
+      if epilogue is not None:
+        # transpose, center LayerNorm, output projection and gating in one kernel
+        output_channel = int(left_act.shape[-1])
+        ln = _layer_norm_params('center_norm', ci)
+        out_p = _linear_params('output_projection', ci, output_channel, left_act.dtype, utils.final_init(gc))
+        gate_p = _linear_params('gating_linear', cz, output_channel, left_act.dtype, utils.final_init(gc),
+                                bias_init=1.)
+        res = [] if residual is None else [residual.reshape(-1, output_channel)]
+        out = epilogue(act.reshape(ci, -1), left_act.reshape(-1, cz), *ln, *out_p, *gate_p, *res)
+        return out.reshape(n0, n1, output_channel)
       act = jnp.transpose(act, (1, 2, 0))
       act = _layer_norm(axis=-1, name='center_norm')(act)
       act = utils.to_half_like(act, left_proj_act)
@@ -1600,7 +1694,7 @@ class TriangleMultiplication(hk.Module):
           output_channel, bias_init=1.,
           initializer=utils.final_init(gc), name='gating_linear')(left_act)
       act *= jax.nn.sigmoid(gate_values)
-      return act
+      return act if residual is None else residual + act
     else:
       # Both left and right projections are fused into projection.
       projection = common_modules.Linear(
@@ -1637,7 +1731,7 @@ class TriangleMultiplication(hk.Module):
         name='gating_linear')(left_act)
     act *= jax.nn.sigmoid(gate_values)
 
-    return act
+    return act if residual is None else residual + act
 
 
 class DistogramHead(hk.Module):
@@ -1788,6 +1882,18 @@ class OuterProductMean(hk.Module):
       act = utils.wide_einsum('acb,ade->dceb', left_act, right_act)
       act = utils.wide_einsum('dceb,cef->dbf', act, output_w) + output_b
       return jnp.transpose(act, [1, 0, 2])
+
+    if gc.get('use_pallas', False):
+      right_t = jnp.transpose(right_act, [0, 2, 1])               # [a, e, d], small
+      w_flat = output_w.reshape(-1, self.num_output_channel)       # [(c e), f]
+
+      def compute_chunk(left_act):  # noqa: F811
+        # [b, c, e, d] is the first GEMM's natural output, and batching the second GEMM over b
+        # reads it in place: no transpose of the [b, d, c*e] intermediate (1.5x on sm_120).
+        act = utils.wide_einsum('abc,aed->bced', left_act, right_t)
+        act = act.reshape(act.shape[0], -1, act.shape[-1])
+        w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
+        return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
     act = mapping.inference_subbatch(
         compute_chunk,
