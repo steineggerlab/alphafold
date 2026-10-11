@@ -837,11 +837,23 @@ class TemplateEmbedding(hk.Module):
 
     scan_init = jnp.zeros((num_res, num_res, c.num_channels),
                           dtype=query_embedding.dtype)
-    summed_template_embeddings, _ = hk.scan(
-        scan_fn, scan_init,
-        (template_batch['template_aatype'],
-         template_batch['template_all_atom_positions'],
-         template_batch['template_all_atom_mask'], unsafe_keys))
+    slots = (template_batch['template_aatype'],
+             template_batch['template_all_atom_positions'],
+             template_batch['template_all_atom_mask'])
+    if is_training or hk.running_init():
+      summed_template_embeddings, _ = hk.scan(scan_fn, scan_init, slots + (unsafe_keys,))
+    else:
+      # the keys only feed dropout, so a slot equal to its predecessor (the empty slots of a template-free run) reuses its embedding
+      def dedupe_fn(carry, x):
+        total, prev, prev_x, valid = carry
+        same = valid & jnp.all(jnp.stack([jnp.all(a == b) for a, b in zip(x, prev_x)]))
+        e = hk.cond(same, lambda p, _: p,
+                    lambda _, s: partial_template_embedder(*s, unsafe_keys[0]).astype(scan_init.dtype), prev, x)
+        return (total + e, e, x, jnp.bool_(True)), None
+
+      first = tuple(a[0] for a in slots)
+      (summed_template_embeddings, *_), _ = hk.scan(
+          dedupe_fn, (scan_init, scan_init, first, jnp.bool_(False)), slots)
 
     embedding = summed_template_embeddings / num_templates
     embedding = jax.nn.relu(embedding)
