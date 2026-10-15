@@ -523,13 +523,16 @@ def _jit_cluster_assign(msa, msa_mask, extra_msa, extra_mask):
   # Agreement = count of residues where an extra sequence matches a cluster
   # centre (a weighted Hamming similarity); only the 21 real-aa classes (0..20)
   # contribute (gap/X/MASK carry weight 0, so the 21-wide one-hot zeroes them).
-  sample = (msa_mask[:, :, None].astype(jnp.int8)
-            * jax.nn.one_hot(msa, 21, dtype=jnp.int8)).reshape(msa.shape[0], -1)
-  extra_oh = (extra_mask[:, :, None].astype(jnp.int8)
-              * jax.nn.one_hot(extra_msa, 21, dtype=jnp.int8)).reshape(
+  # float16 in, float32 accumulate: exact (0/1 inputs, counts <= num_res < 2**24)
+  # and supported on every GPU. An int8 dot goes to cuBLASLt, which rejects it on
+  # sm_75 (T4) when Triton GEMM is off.
+  sample = (msa_mask[:, :, None].astype(jnp.float16)
+            * jax.nn.one_hot(msa, 21, dtype=jnp.float16)).reshape(msa.shape[0], -1)
+  extra_oh = (extra_mask[:, :, None].astype(jnp.float16)
+              * jax.nn.one_hot(extra_msa, 21, dtype=jnp.float16)).reshape(
                   extra_msa.shape[0], -1)
   agreement = jax.lax.dot_general(extra_oh, sample, (((1,), (1,)), ((), ())),
-                                  preferred_element_type=jnp.int32)
+                                  preferred_element_type=jnp.float32)
   return jnp.argmax(agreement, axis=1).astype(jnp.int32)
 
 
