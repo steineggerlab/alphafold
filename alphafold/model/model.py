@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Code for constructing the model."""
+import functools
 from typing import Any, Mapping, Optional, Union
 
 from absl import logging
@@ -28,6 +29,28 @@ import ml_collections
 import numpy as np
 from alphafold.model.tf import np_backend as tf
 import tree
+
+
+# keep coordinates in fp32 to keep backbone bond precision; one dispatch for the whole tree
+@jax.jit
+def _cast_result(result):
+  coords = jax.tree_util.DictKey("final_atom_positions")
+  return jax.tree_util.tree_map_with_path(
+      lambda path, v: v.astype(jnp.float32 if path[-1] == coords else jnp.float16), result)
+
+
+@functools.partial(jax.jit, static_argnames=("size",))
+def _slice_recycle(feat, start, size):
+  """feat[start:start + size] for every feature, in one dispatch."""
+  return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, size), feat)
+
+
+def _fetch_small(tree, limit=1 << 20):
+  """tree with its leaves up to limit bytes on the host, in one transfer; the [L, L, 64] logits stay on device."""
+  leaves, treedef = jax.tree_util.tree_flatten(tree)
+  small = iter(jax.device_get([x for x in leaves if x.nbytes <= limit]))
+  return treedef.unflatten([next(small) if x.nbytes <= limit else x for x in leaves])
+
 
 class RunModel:
   """Container for JAX model."""
@@ -151,7 +174,7 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-    zeros = lambda shape: np.zeros(shape, dtype=np.float16)
+    zeros = lambda shape: jnp.zeros(shape, dtype=jnp.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
             'prev_pair':          zeros([L,L,128])}
     
@@ -166,16 +189,10 @@ class RunModel:
     feat = jax.device_put(feat)
     prev = jax.device_put(prev)
 
-    # keep coordinates in fp32 to keep backbone bond precision
-    coords = jax.tree_util.DictKey("final_atom_positions")
-    def cast(path, v):
-      return jnp.asarray(v, jnp.float32 if path[-1] == coords else jnp.float16)
-
     def run(key, feat, prev):
-      result = jax.tree_util.tree_map_with_path(
-          cast, self.apply(self.params, key, {**feat, "prev": prev}))
+      result = _cast_result(self.apply(self.params, key, {**feat, "prev": prev}))
       prev = result.pop("prev")
-      return jax.device_get(result), prev
+      return _fetch_small(result), prev
 
 
     # initialize random key
@@ -187,9 +204,7 @@ class RunModel:
         if self.multimer_mode:
           sub_feat = feat
         else:
-          s = r * num_ensemble
-          e = (r+1) * num_ensemble
-          sub_feat = jax.tree_util.tree_map(lambda x:x[s:e], feat)
+          sub_feat = _slice_recycle(feat, r * num_ensemble, num_ensemble)
             
         # run
         key, sub_key = jax.random.split(key)
@@ -208,5 +223,6 @@ class RunModel:
           break
         if r > 0 and result["tol"] < self.config.model.recycle_early_stop_tolerance:
           break
+    result = jax.device_get(result)
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, r
