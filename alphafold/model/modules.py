@@ -711,14 +711,14 @@ class Attention(hk.Module):
     return fused_ops.ln_projection(self.global_config, act.dtype, int(act.shape[-1]),
                                    self.config.num_head * key_dim)
 
-  def packed(self, act, mask, nonbatched_bias=None, column=False, query_ln=None, bias_w=None, residual=None):
+  def packed(self, act, mask, nonbatched_bias=None, column=False, query_ln=None, bias_w=None, residual=None, fp8=False):
     """Self-attention over the rows of act [X, Y, a], or its columns when column.
 
     One GEMM projects q/k/v/gate, which the kernel reads in place: no transposes.
     mask is [X, Y]; nonbatched_bias [h, S, S] for the attended axis S.
     query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h]
     when given.
-    residual [X, Y, output_dim] is added to the output.
+    residual [X, Y, output_dim] is added to the output. fp8 lets k and v go e4m3 where global_config.fp8 asks.
     """
     X, Y, a = act.shape
     num_head = self.config.num_head
@@ -733,11 +733,17 @@ class Attention(hk.Module):
       gate_bias = hk.get_parameter('gating_b', shape=(num_head, value_dim), dtype=act.dtype,
                                    init=hk.initializers.Constant(1.0))
     w = jnp.stack(w, axis=1)
+    kv = None
     if query_ln is None:
       p = jnp.dot(act.reshape(-1, a), w.reshape(a, -1))
     else:
-      p, b = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
-                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w)
+      # an fp8 kernel reads k and v in e4m3, written so by the projection
+      kv8 = fp8 and fused_ops.fp8_attention(self.global_config, key_dim)
+      out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
+                                           jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
+                                           f8_slots=(1, 2) if kv8 else ())
+      p, b = out[:2]
+      kv = out[2].reshape(X, Y, 2, num_head, key_dim) if kv8 else None
       if bias_w is not None:
         nonbatched_bias = b.reshape(-1, X, Y)
         if column:
@@ -749,7 +755,7 @@ class Attention(hk.Module):
     kmask = utils.mask_to_bias(mask, act.dtype) > -1e3
     if nonbatched_bias is None:
       nonbatched_bias = jnp.zeros((num_head, s, s), act.dtype)
-    out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias,
+    out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias, *([] if kv is None else [kv]),
                                   sm_scale=key_dim**(-0.5), column=column)
     o_init = hk.initializers.Constant(0.0) if self.global_config.zero_init else glorot_uniform()
     o_weights = hk.get_parameter('output_w', shape=(num_head, value_dim, self.output_dim),
@@ -1262,7 +1268,8 @@ class TriangleAttention(hk.Module):
     if packed and attn_mod.ln_projection_kernel(pair_act) is not None:
       # the query LayerNorm runs inside the kernel that projects q/k/v/gate and the bias
       ln = _layer_norm_params('query_norm', pair_act.shape[-1])
-      return attn_mod.packed(pair_act, pair_mask, column=column, query_ln=ln, bias_w=weights, residual=residual)
+      return attn_mod.packed(pair_act, pair_mask, column=column, query_ln=ln, bias_w=weights, residual=residual,
+                             fp8=True)
 
     pair_act = common_modules.LayerNorm(
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
@@ -1805,11 +1812,19 @@ class TriangleMultiplication(hk.Module):
     in_ln = _layer_norm_params('left_norm_input', cz)
     p_w, p_b = _linear_params('projection', cz, 2 * ci, act.dtype, 'linear')
     g_w, g_b = _linear_params('gate', cz, 2 * ci, act.dtype, utils.final_init(gc), bias_init=1.)
-    left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, mask.reshape(-1))
     lhs, rhs = c.equation.split('->')[0].split(',')
-    move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
-    # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
-    tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1))
+    fp8 = fused_ops.fp8_contraction(gc, act.dtype, cz, ci, n1)
+    if fp8 is not None:
+      # e4m3 operands contracted along their last axis, cuBLASLt's FP8 form: incoming edges read the pair transposed
+      proj, contract = fp8
+      incoming = lhs == 'kjc'
+      left_p, right_p = proj(act, *in_ln, p_w, p_b, g_w, g_b, mask, transpose=incoming)
+      tri = contract(*((right_p, left_p) if incoming else (left_p, right_p)))
+    else:
+      left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, mask.reshape(-1))
+      move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
+      # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+      tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1))
     ln = _layer_norm_params('center_norm', ci)
     out_p = _linear_params('output_projection', ci, cz, act.dtype, utils.final_init(gc))
     gate_p = _linear_params('gating_linear', cz, cz, act.dtype, utils.final_init(gc), bias_init=1.)

@@ -382,6 +382,7 @@ CONFIG = ml_collections.ConfigDict({
             'kernel_backend': 'pallas',  # or 'cuda_legacy'
             'bfloat16_output': False,
             'deterministic': False,
+            'fp8': False,  # e4m3 triangle attention and contraction on sm_89+, lossy
             'multimer_mode': False,
             'subbatch_size': 4,
             'use_remat': False,
@@ -624,6 +625,7 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
             'kernel_backend': 'pallas',  # or 'cuda_legacy'
             'bfloat16_output': False,
             'deterministic': False,
+            'fp8': False,  # e4m3 triangle attention and contraction on sm_89+, lossy
             'multimer_mode': True,
             'subbatch_size': 4,
             'use_remat': False,
