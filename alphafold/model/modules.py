@@ -1878,6 +1878,8 @@ class OuterProductMean(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 10 "OuterProductMean"
   """
 
+  takes_residual = True
+
   def __init__(self,
                config,
                global_config,
@@ -1888,7 +1890,7 @@ class OuterProductMean(hk.Module):
     self.config = config
     self.num_output_channel = num_output_channel
 
-  def __call__(self, act, mask, is_training=True):
+  def __call__(self, act, mask, is_training=True, residual=None):
     """Builds OuterProductMean module.
 
     Arguments:
@@ -1967,6 +1969,12 @@ class OuterProductMean(hk.Module):
       t = t.reshape(rows * output_w.shape[0], d * self.num_output_channel)
 
       lhs = jnp.transpose(left_act, [1, 0, 2]).reshape(left_act.shape[1], -1)
+      fused = fused_ops.opm_update(gc, act.dtype, lhs.shape[1], self.num_output_channel)
+      if fused is not None:
+        # the GEMM, bias, mask norm and residual in one pass: the [b, d*f] product is never written
+        norm = utils.wide_einsum('abc,adc->bdc', mask, mask)[..., 0]
+        res = [] if residual is None else [residual]
+        return fused(lhs, t.reshape(t.shape[0], d, -1), output_b, norm, *res)
       # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
       act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
     else:
@@ -1984,7 +1992,7 @@ class OuterProductMean(hk.Module):
     act /= epsilon + norm
     act = act.astype(_ref.dtype)
 
-    return act
+    return act if residual is None else residual + act
 
 
 def dgram_from_positions(positions, num_bins, min_bin, max_bin):
