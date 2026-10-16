@@ -618,12 +618,12 @@ class Transition(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 15 "PairTransition"
   """
 
+  takes_residual = True
+
   def __init__(self, config, global_config, name='transition_block'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
-
-  takes_residual = True
 
   def __call__(self, act, mask, is_training=True, residual=None):
     """Builds Transition module.
@@ -705,11 +705,19 @@ class Attention(hk.Module):
     value_dim = self.config.get('value_dim', int(act.shape[-1])) // num_head
     return fused_ops.packed_attention(self.global_config, act.dtype, key_dim, value_dim)
 
-  def packed(self, act, mask, nonbatched_bias=None, column=False):
+  def ln_projection_kernel(self, act):
+    """The kernel that layer-norms act and projects q/k/v/gate and the pair bias, or None."""
+    key_dim = self.config.get('key_dim', int(act.shape[-1])) // self.config.num_head
+    return fused_ops.ln_projection(self.global_config, act.dtype, int(act.shape[-1]),
+                                   self.config.num_head * key_dim)
+
+  def packed(self, act, mask, nonbatched_bias=None, column=False, query_ln=None, bias_w=None, residual=None):
     """Self-attention over the rows of act [X, Y, a], or its columns when column.
 
     One GEMM projects q/k/v/gate, which the kernel reads in place: no transposes.
     mask is [X, Y]; nonbatched_bias [h, S, S] for the attended axis S.
+    query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h].
+    residual [X, Y, output_dim] is added to the output.
     """
     X, Y, a = act.shape
     num_head = self.config.num_head
@@ -723,8 +731,16 @@ class Attention(hk.Module):
                                 init=hk.initializers.Constant(0.0)))
       gate_bias = hk.get_parameter('gating_b', shape=(num_head, value_dim), dtype=act.dtype,
                                    init=hk.initializers.Constant(1.0))
-    w = jnp.stack(w, axis=1).reshape(a, -1)
-    p = jnp.dot(act.reshape(-1, a), w).reshape(X, Y, -1, num_head, key_dim)
+    w = jnp.stack(w, axis=1)
+    if query_ln is None:
+      p = jnp.dot(act.reshape(-1, a), w.reshape(a, -1))
+    else:
+      p, b = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
+                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w)
+      nonbatched_bias = b.reshape(-1, X, Y)
+      if column:
+        nonbatched_bias = jnp.swapaxes(nonbatched_bias, 1, 2)
+    p = p.reshape(X, Y, -1, num_head, key_dim)
     if column:
       mask = mask.T
     s = mask.shape[1]
@@ -738,8 +754,13 @@ class Attention(hk.Module):
                                  dtype=act.dtype, init=o_init)
     o_bias = hk.get_parameter('output_b', shape=(self.output_dim,), dtype=act.dtype,
                               init=hk.initializers.Constant(0.0))
-    out = jnp.dot(out.reshape(X * Y, -1), o_weights.reshape(-1, self.output_dim)) + o_bias
-    return out.reshape(X, Y, self.output_dim)
+    out, o_weights = out.reshape(X * Y, -1), o_weights.reshape(-1, self.output_dim)
+    proj = fused_ops.output_projection(self.global_config, act.dtype, num_head * value_dim, self.output_dim)
+    if proj is not None:
+      res = [] if residual is None else [residual.reshape(X * Y, -1)]
+      return proj(out, o_weights, o_bias, *res).reshape(X, Y, self.output_dim)
+    out = (jnp.dot(out, o_weights) + o_bias).reshape(X, Y, self.output_dim)
+    return out if residual is None else residual + out
 
   def __call__(self, q_data, m_data, bias, nonbatched_bias=None):
     """Builds Attention module.
@@ -1009,20 +1030,26 @@ class MSARowAttentionWithPairBias(hk.Module):
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
             msa_act)
 
-    pair_act = common_modules.LayerNorm(
-        axis=[-1],
-        create_scale=True,
-        create_offset=True,
-        name='feat_2d_norm')(
-            pair_act)
-
     init_factor = 1. / jnp.sqrt(int(pair_act.shape[-1]))
     weights = hk.get_parameter(
         'feat_2d_weights',
         shape=(pair_act.shape[-1], c.num_head),
         dtype=msa_act.dtype,
         init=hk.initializers.RandomNormal(stddev=init_factor))
-    nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
+    n, cz = pair_act.shape[0], pair_act.shape[-1]
+    feat_2d = fused_ops.ln_projection(self.global_config, pair_act.dtype, cz)
+    if feat_2d is not None:
+      # the pair LayerNorm and the bias projection in one pass, the normed pair is never written
+      ln = _layer_norm_params('feat_2d_norm', cz)
+      nonbatched_bias = feat_2d(pair_act.reshape(-1, cz), *ln, None, weights)[1].reshape(-1, n, n)
+    else:
+      pair_act = common_modules.LayerNorm(
+          axis=[-1],
+          create_scale=True,
+          create_offset=True,
+          name='feat_2d_norm')(
+              pair_act)
+      nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
 
     attn_mod = Attention(
         c, self.global_config, msa_act.shape[-1])
@@ -1170,12 +1197,14 @@ class TriangleAttention(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 14 "TriangleAttentionEndingNode"
   """
 
+  takes_residual = True
+
   def __init__(self, config, global_config, name='triangle_attention'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
 
-  def __call__(self, pair_act, pair_mask, is_training=False):
+  def __call__(self, pair_act, pair_mask, is_training=False, residual=None):
     """Builds TriangleAttention module.
 
     Arguments:
@@ -1203,20 +1232,25 @@ class TriangleAttention(hk.Module):
     bias = utils.mask_to_bias(pair_mask, pair_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
-    pair_act = common_modules.LayerNorm(
-        axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
-            pair_act)
-
     init_factor = 1. / jnp.sqrt(int(pair_act.shape[-1]))
     weights = hk.get_parameter(
         'feat_2d_weights',
         shape=(pair_act.shape[-1], c.num_head),
         dtype=pair_act.dtype,
         init=hk.initializers.RandomNormal(stddev=init_factor))
+
+    if packed and attn_mod.ln_projection_kernel(pair_act) is not None:
+      # the query LayerNorm runs inside the kernel that projects q/k/v/gate and the bias
+      ln = _layer_norm_params('query_norm', pair_act.shape[-1])
+      return attn_mod.packed(pair_act, pair_mask, column=column, query_ln=ln, bias_w=weights, residual=residual)
+
+    pair_act = common_modules.LayerNorm(
+        axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
+            pair_act)
     nonbatched_bias = jnp.einsum('kqc,ch->hqk' if column and packed else 'qkc,ch->hqk', pair_act, weights)
 
     if packed:
-      return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column)
+      return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column, residual=residual)
     if attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
@@ -1230,7 +1264,7 @@ class TriangleAttention(hk.Module):
     if column:
       pair_act = jnp.swapaxes(pair_act, -2, -3)
 
-    return pair_act
+    return pair_act if residual is None else residual + pair_act
 
 
 class MaskedMsaHead(hk.Module):
@@ -1550,12 +1584,12 @@ class TriangleMultiplication(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 12 "TriangleMultiplicationIncoming"
   """
 
+  takes_residual = True
+
   def __init__(self, config, global_config, name='triangle_multiplication'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
-
-  takes_residual = True
 
   def __call__(self, left_act, left_mask, is_training=True, residual=None):
     """Builds TriangleMultiplication module.
@@ -1653,6 +1687,10 @@ class TriangleMultiplication(hk.Module):
     c = self.config
     gc = self.global_config
 
+    ln_gdp = fused_ops.ln_gated_dual_proj(gc, left_act.dtype, left_act.shape[-1], c.num_intermediate_channel)
+    if ln_gdp is not None:
+      return self._ln_fused_triangle_multiplication(ln_gdp, left_act, left_mask, residual)
+
     left_act = _layer_norm(axis=-1, name='left_norm_input')(left_act)
 
     gated_dual_proj = fused_ops.gated_dual_proj(gc, left_act.dtype)
@@ -1736,6 +1774,29 @@ class TriangleMultiplication(hk.Module):
     act *= jax.nn.sigmoid(gate_values)
 
     return act if residual is None else residual + act
+
+  @hk.transparent
+  def _ln_fused_triangle_multiplication(self, ln_gdp, act, mask, residual=None):
+    """The fused path with left_norm_input inside both kernels: the normed pair is never written out."""
+    c = self.config
+    gc = self.global_config
+    ci, cz = c.num_intermediate_channel, act.shape[-1]
+    n0, n1 = act.shape[0], act.shape[1]
+    in_ln = _layer_norm_params('left_norm_input', cz)
+    p_w, p_b = _linear_params('projection', cz, 2 * ci, act.dtype, 'linear')
+    g_w, g_b = _linear_params('gate', cz, 2 * ci, act.dtype, utils.final_init(gc), bias_init=1.)
+    left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, mask.reshape(-1))
+    lhs, rhs = c.equation.split('->')[0].split(',')
+    move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
+    # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+    tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1))
+    ln = _layer_norm_params('center_norm', ci)
+    out_p = _linear_params('output_projection', ci, cz, act.dtype, utils.final_init(gc))
+    gate_p = _linear_params('gating_linear', cz, cz, act.dtype, utils.final_init(gc), bias_init=1.)
+    epilogue = fused_ops.trimul_epilogue_ln(gc, act.dtype)
+    out = epilogue(tri.reshape(ci, -1), act.reshape(-1, cz), *in_ln, *ln, *out_p, *gate_p,
+                   add_input=residual is act).reshape(n0, n1, cz)
+    return out if residual is None or residual is act else residual + out
 
 
 class DistogramHead(hk.Module):
