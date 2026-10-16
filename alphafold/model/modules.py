@@ -37,6 +37,10 @@ import jax.numpy as jnp
 # wider chunk makes it pick fusions that want more shared memory than RDNA has.
 _TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
 
+# Up to this many MSA rows the outer product mean folds its output weights into the right side, then contracts rows and
+# channels in one GEMM: fewer FLOPs below 32 rows (num_outer_channel); on gfx1151 2-5x faster to 16, even at 32.
+OPM_REASSOCIATE_ROWS = 16
+
 
 def transition_subbatch(global_config, shape, num_intermediate, dtype):
   """Subbatch that keeps a transition's intermediate near the budget."""
@@ -1895,14 +1899,24 @@ class OuterProductMean(hk.Module):
         w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
-    act = mapping.inference_subbatch(
-        compute_chunk,
-        c.chunk_size,
-        batched_args=[left_act],
-        nonbatched_args=[],
-        low_memory=True,
-        input_subbatch_dim=1,
-        output_subbatch_dim=0)
+    if left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
+      # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
+      rows, d, _ = right_act.shape
+      t = utils.wide_einsum('ade,cef->acdf', right_act, output_w).astype(act.dtype)
+      t = t.reshape(rows * output_w.shape[0], d * self.num_output_channel)
+
+      lhs = jnp.transpose(left_act, [1, 0, 2]).reshape(left_act.shape[1], -1)
+      # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
+      act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
+    else:
+      act = mapping.inference_subbatch(
+          compute_chunk,
+          c.chunk_size,
+          batched_args=[left_act],
+          nonbatched_args=[],
+          low_memory=True,
+          input_subbatch_dim=1,
+          output_subbatch_dim=0)
 
     epsilon = 1e-3
     norm = utils.wide_einsum('abc,adc->bdc', mask, mask)
