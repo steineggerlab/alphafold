@@ -716,7 +716,8 @@ class Attention(hk.Module):
 
     One GEMM projects q/k/v/gate, which the kernel reads in place: no transposes.
     mask is [X, Y]; nonbatched_bias [h, S, S] for the attended axis S.
-    query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h].
+    query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h]
+    when given.
     residual [X, Y, output_dim] is added to the output.
     """
     X, Y, a = act.shape
@@ -737,9 +738,10 @@ class Attention(hk.Module):
     else:
       p, b = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                             jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w)
-      nonbatched_bias = b.reshape(-1, X, Y)
-      if column:
-        nonbatched_bias = jnp.swapaxes(nonbatched_bias, 1, 2)
+      if bias_w is not None:
+        nonbatched_bias = b.reshape(-1, X, Y)
+        if column:
+          nonbatched_bias = jnp.swapaxes(nonbatched_bias, 1, 2)
     p = p.reshape(X, Y, -1, num_head, key_dim)
     if column:
       mask = mask.T
@@ -995,6 +997,8 @@ class MSARowAttentionWithPairBias(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 7 "MSARowAttentionWithPairBias"
   """
 
+  takes_residual = True
+
   def __init__(self, config, global_config,
                name='msa_row_attention_with_pair_bias'):
     super().__init__(name=name)
@@ -1005,7 +1009,8 @@ class MSARowAttentionWithPairBias(hk.Module):
                msa_act,
                msa_mask,
                pair_act,
-               is_training=False):
+               is_training=False,
+               residual=None):
     """Builds MSARowAttentionWithPairBias module.
 
     Arguments:
@@ -1026,9 +1031,17 @@ class MSARowAttentionWithPairBias(hk.Module):
     bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
-    msa_act = common_modules.LayerNorm(
-        axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
-            msa_act)
+    attn_mod = Attention(
+        c, self.global_config, msa_act.shape[-1])
+    packed = attn_mod.packed_kernel(msa_act) is not None
+    query_ln = None
+    if packed and attn_mod.ln_projection_kernel(msa_act) is not None:
+      # the query LayerNorm runs inside the kernel that projects q/k/v/gate
+      query_ln = _layer_norm_params('query_norm', msa_act.shape[-1])
+    else:
+      msa_act = common_modules.LayerNorm(
+          axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
+              msa_act)
 
     init_factor = 1. / jnp.sqrt(int(pair_act.shape[-1]))
     weights = hk.get_parameter(
@@ -1051,10 +1064,8 @@ class MSARowAttentionWithPairBias(hk.Module):
               pair_act)
       nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
 
-    attn_mod = Attention(
-        c, self.global_config, msa_act.shape[-1])
-    if attn_mod.packed_kernel(msa_act) is not None:
-      return attn_mod.packed(msa_act, msa_mask, nonbatched_bias)
+    if packed:
+      return attn_mod.packed(msa_act, msa_mask, nonbatched_bias, query_ln=query_ln, residual=residual)
     if attention_fused(self.global_config, c, msa_act):
       # Pallas flash attention doesn't materialize the [N,N] matrix
       # memory-saving subbatch chunking is unneeded
@@ -1067,7 +1078,7 @@ class MSARowAttentionWithPairBias(hk.Module):
           nonbatched_args=[nonbatched_bias],
           low_memory=not is_training)
 
-    return msa_act
+    return msa_act if residual is None else residual + msa_act
 
 
 class MSAColumnAttention(hk.Module):
@@ -1075,6 +1086,8 @@ class MSAColumnAttention(hk.Module):
 
   Jumper et al. (2021) Suppl. Alg. 8 "MSAColumnAttention"
   """
+
+  takes_residual = True
 
   def __init__(self, config, global_config, name='msa_column_attention'):
     super().__init__(name=name)
@@ -1084,7 +1097,8 @@ class MSAColumnAttention(hk.Module):
   def __call__(self,
                msa_act,
                msa_mask,
-               is_training=False):
+               is_training=False,
+               residual=None):
     """Builds MSAColumnAttention module.
 
     Arguments:
@@ -1111,12 +1125,17 @@ class MSAColumnAttention(hk.Module):
     bias = utils.mask_to_bias(msa_mask, msa_act.dtype)[:, None, None, :]
     assert len(bias.shape) == 4
 
+    if packed and attn_mod.ln_projection_kernel(msa_act) is not None:
+      # the query LayerNorm runs inside the kernel that projects q/k/v/gate
+      ln = _layer_norm_params('query_norm', msa_act.shape[-1])
+      return attn_mod.packed(msa_act, msa_mask, column=True, query_ln=ln, residual=residual)
+
     msa_act = common_modules.LayerNorm(
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
             msa_act)
 
     if packed:
-      return attn_mod.packed(msa_act, msa_mask, column=True)
+      return attn_mod.packed(msa_act, msa_mask, column=True, residual=residual)
     if attention_fused(self.global_config, c, msa_act):
       msa_act = attn_mod(msa_act, msa_act, bias)
     else:
@@ -1129,7 +1148,7 @@ class MSAColumnAttention(hk.Module):
 
     msa_act = jnp.swapaxes(msa_act, -2, -3)
 
-    return msa_act
+    return msa_act if residual is None else residual + msa_act
 
 
 class MSAColumnGlobalAttention(hk.Module):
@@ -1178,9 +1197,10 @@ class MSAColumnGlobalAttention(hk.Module):
         name='attention')
     # [N_seq, N_res, 1]
     msa_mask = jnp.expand_dims(msa_mask, axis=-1)
+    # chunks to the transition's budget (gate, output and their f32 temporaries), not 4 columns: 60k launches a fold
     msa_act = mapping.inference_subbatch(
         attn_mod,
-        self.global_config.subbatch_size,
+        transition_subbatch(self.global_config, msa_act.shape, 4 * msa_act.shape[-1], msa_act.dtype),
         batched_args=[msa_act, msa_act, msa_mask],
         nonbatched_args=[],
         low_memory=not is_training)
