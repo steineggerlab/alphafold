@@ -688,6 +688,17 @@ def glorot_uniform():
                                          distribution='uniform')
 
 
+def _fp8_slots(global_config, dtype, key_dim, seq_len):
+  """(e4m3 slots, scales or None) the projection writes for the attention kernel that runs, or None.
+
+  colabfold-kernels 0.7 picks per kernel (Mosaic GPU on sm_120 takes q, pre-scaled, and k); before it, Triton's k and v.
+  """
+  slots = getattr(fused_ops, 'fp8_attention_slots', None)
+  if slots is not None:
+    return slots(global_config, dtype, key_dim, seq_len)
+  return ((1, 2), None) if fused_ops.fp8_attention(global_config, key_dim) else None
+
+
 class Attention(hk.Module):
   """Multihead attention."""
 
@@ -733,17 +744,19 @@ class Attention(hk.Module):
       gate_bias = hk.get_parameter('gating_b', shape=(num_head, value_dim), dtype=act.dtype,
                                    init=hk.initializers.Constant(1.0))
     w = jnp.stack(w, axis=1)
-    kv = None
+    p8 = None
     if query_ln is None:
       p = jnp.dot(act.reshape(-1, a), w.reshape(a, -1))
     else:
-      # an fp8 kernel reads k and v in e4m3, written so by the projection
-      kv8 = fp8 and fused_ops.fp8_attention(self.global_config, key_dim)
+      # the projection writes the slots the attention kernel reads in e4m3, with their scales
+      f8 = fp8 and _fp8_slots(self.global_config, act.dtype, key_dim, X if column else Y)
+      f8_slots, f8_scales = f8 or ((), None)
+      # f8_scales only where given: colabfold-kernels before 0.7 has no such argument
       out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
-                                           f8_slots=(1, 2) if kv8 else ())
+                                           f8_slots=f8_slots, **({} if f8_scales is None else {'f8_scales': f8_scales}))
       p, b = out[:2]
-      kv = out[2].reshape(X, Y, 2, num_head, key_dim) if kv8 else None
+      p8 = out[2].reshape(X, Y, 2, num_head, key_dim) if f8 else None
       if bias_w is not None:
         nonbatched_bias = b.reshape(-1, X, Y)
         if column:
@@ -755,7 +768,7 @@ class Attention(hk.Module):
     kmask = utils.mask_to_bias(mask, act.dtype) > -1e3
     if nonbatched_bias is None:
       nonbatched_bias = jnp.zeros((num_head, s, s), act.dtype)
-    out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias, *([] if kv is None else [kv]),
+    out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias, *([] if p8 is None else [p8]),
                                   sm_scale=key_dim**(-0.5), column=column)
     o_init = hk.initializers.Constant(0.0) if self.global_config.zero_init else glorot_uniform()
     o_weights = hk.get_parameter('output_w', shape=(num_head, value_dim, self.output_dim),
