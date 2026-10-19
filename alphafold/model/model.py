@@ -21,6 +21,7 @@ from alphafold.common import confidence
 from alphafold.model import features
 from alphafold.model import modules
 from alphafold.model import modules_multimer
+from alphafold.model import msa_sampling
 from alphafold.common import residue_constants
 import haiku as hk
 import jax
@@ -161,6 +162,16 @@ class RunModel:
     Returns:
       A dictionary of model outputs.
     """
+    # split_msa_sampling: multimer samples the MSA in its own jit, the model sees fixed shapes whatever the depth
+    raw = None
+    if self.multimer_mode and self.config.model.get('split_msa_sampling', False):
+      c = self.config.model.embeddings_and_evoformer
+      feat = dict(feat)
+      raw = {k: feat.pop(k) for k in msa_sampling.RAW if k in feat}
+      raw = jax.device_put(msa_sampling.pad_raw(raw, msa_sampling.depth_bucket(len(raw['msa']),
+                                                                                c.num_msa + c.num_extra_msa)))
+      if getattr(self, '_sampler', None) is None:
+        self._sampler = msa_sampling.make_sampler(c)
     self.init_params(feat)
     logging.info('Running predict with shape(feat) = %s',
                  tree.map_structure(lambda x: x.shape, feat))
@@ -202,13 +213,15 @@ class RunModel:
     # iterate through recycles
     for r in range(num_iters):      
         # grab subset of features
-        if self.multimer_mode:
+        key, sub_key = jax.random.split(key)
+        if raw is not None:
+          sub_feat = {**feat, **self._sampler(raw, sub_key)}
+        elif self.multimer_mode:
           sub_feat = feat
         else:
           sub_feat = _slice_recycle(feat, r * num_ensemble, num_ensemble)
-            
+
         # run
-        key, sub_key = jax.random.split(key)
         result, prev = run(sub_key, sub_feat, prev)
         
         if return_representations:

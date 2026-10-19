@@ -276,6 +276,15 @@ def sample_msa(key, batch, max_seq):
   return batch
 
 
+def sample(batch, sample_key, mask_key, config):
+  """The MSA sampling of one recycle: cluster centres, BERT mask, cluster profiles; the extra rows uncropped."""
+  batch = sample_msa(sample_key, batch, config.num_msa)
+  batch = make_masked_msa(batch, mask_key, config.masked_msa)
+  if config.use_cluster_profile:
+    batch['cluster_profile'], batch['cluster_deletion_mean'] = nearest_neighbor_clusters(batch)
+  return batch
+
+
 def make_msa_profile(batch):
   """Compute the MSA profile."""
 
@@ -577,7 +586,10 @@ class EmbeddingsAndEvoformer(hk.Module):
 
     output = {}
 
-    batch['msa_profile'] = make_msa_profile(batch)
+    # msa_sampling.sampler may have sampled the MSA already, with the keys below (extra_msa is in the batch)
+    presampled = 'extra_msa' in batch
+    if not presampled:
+      batch['msa_profile'] = make_msa_profile(batch)
 
     with utils.half_context():
       target_feat = jax.nn.one_hot(batch['aatype'], 21).astype(dtype)
@@ -587,12 +599,8 @@ class EmbeddingsAndEvoformer(hk.Module):
               target_feat)
 
       safe_key, sample_key, mask_key = safe_key.split(3)
-      batch = sample_msa(sample_key, batch, c.num_msa)
-      batch = make_masked_msa(batch, mask_key, c.masked_msa)
-
-      if c.use_cluster_profile:
-        (batch['cluster_profile'],
-         batch['cluster_deletion_mean']) = nearest_neighbor_clusters(batch)
+      if not presampled:
+        batch = sample(batch, sample_key, mask_key, c)
 
 
       msa_feat = create_msa_feat(batch).astype(dtype)

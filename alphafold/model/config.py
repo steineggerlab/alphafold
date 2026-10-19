@@ -714,6 +714,8 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
         # recycling steps.
         'num_recycle': 20,
         'recycle_early_stop_tolerance': 0.5,
-        'resample_msa_in_recycling': True
+        'resample_msa_in_recycling': True,
+        # sample the MSA in its own jit (msa_sampling): one model compile per length, one sampler compile per depth
+        'split_msa_sampling': False
     }
 })
