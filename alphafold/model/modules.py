@@ -41,6 +41,22 @@ _TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
 # channels in one GEMM: fewer FLOPs below 32 rows (num_outer_channel); on gfx1151 2-5x faster to 16, even at 32.
 OPM_REASSOCIATE_ROWS = 16
 
+def _live_length(alive):
+  """1 + the last index alive [N] marks, traced."""
+  return jnp.max(jnp.where(alive, jnp.arange(alive.shape[0]) + 1, 0))
+
+
+def _inside(alive, align=128):
+  """alive [N] -> the leading positions up to its last live one, rounded up to align: what a trimmed attention reads."""
+  return jnp.arange(alive.shape[0]) < -(-_live_length(alive) // align) * align
+
+
+def _region_keep(mask):
+  """mask [X, Y] flattened as a projection's keep, below zero past its live rows and columns (rounded up to the
+  attention's tiles): that projection writes nothing there, as the trimmed attention it feeds reads nothing there."""
+  inside = _inside(jnp.any(mask > 0, axis=1))[:, None] & _inside(jnp.any(mask > 0, axis=0))[None, :]
+  return jnp.where(inside, mask, -1).astype(mask.dtype).reshape(-1)
+
 
 def transition_subbatch(global_config, shape, num_intermediate, dtype):
   """Subbatch that keeps a transition's intermediate near the budget."""
@@ -620,12 +636,10 @@ class Transition(hk.Module):
 
   takes_residual = True
 
-  def __init__(self, config, global_config, name='transition_block', skip_padding=False):
+  def __init__(self, config, global_config, name='transition_block'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
-    # the fused kernel skips row blocks the mask leaves out (an MSA padded to its full depth)
-    self.skip_padding = skip_padding
 
   def __call__(self, act, mask, is_training=True, residual=None):
     """Builds Transition module.
@@ -650,10 +664,10 @@ class Transition(hk.Module):
       t1 = _linear_params('transition1', nc, num_intermediate, act.dtype, 'relu')
       t2 = _linear_params('transition2', num_intermediate, nc, act.dtype,
                           utils.final_init(self.global_config))
-      keep = [mask.reshape(-1)] if self.skip_padding else []
+      # the fused kernel skips row blocks the mask leaves out: the padding of the MSA's depth or the pair's length
       if residual is act:
-        return fused(act, *ln, *t1, *t2, *keep, add_input=True)
-      out = fused(act, *ln, *t1, *t2, *keep)
+        return fused(act, *ln, *t1, *t2, mask.reshape(-1), add_input=True)
+      out = fused(act, *ln, *t1, *t2, mask.reshape(-1))
       return out if residual is None else residual + out
 
     act = common_modules.LayerNorm(
@@ -737,7 +751,8 @@ class Attention(hk.Module):
     query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h]
     when given.
     residual [X, Y, output_dim] is added to the output. fp8 lets k and v go e4m3 where global_config.fp8 asks.
-    keep [X * Y]: the projections skip row blocks it leaves out.
+    keep [X * Y]: the projections skip row blocks it leaves out; the q/k/v projection does not even write those outside
+    what the trimmed attention reads.
     """
     X, Y, a = act.shape
     num_head = self.config.num_head
@@ -762,7 +777,7 @@ class Attention(hk.Module):
       # f8_scales only where given: colabfold-kernels before 0.7 has no such argument
       out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
-                                           *([] if keep is None else [keep]),
+                                           *([] if keep is None else [_region_keep(mask) if self.trim else keep]),
                                            f8_slots=f8_slots, **({} if f8_scales is None else {'f8_scales': f8_scales}))
       p, b = out[:2]
       p8 = out[2].reshape(X, Y, 2, num_head, key_dim) if f8 else None
@@ -1082,9 +1097,12 @@ class MSARowAttentionWithPairBias(hk.Module):
     n, cz = pair_act.shape[0], pair_act.shape[-1]
     feat_2d = fused_ops.ln_projection(self.global_config, pair_act.dtype, cz)
     if feat_2d is not None:
-      # the pair LayerNorm and the bias projection in one pass, the normed pair is never written
+      # the pair LayerNorm and the bias projection in one pass, the normed pair is never written; with the trimmed
+      # attention only the live residues' block of it
       ln = _layer_norm_params('feat_2d_norm', cz)
-      nonbatched_bias = feat_2d(pair_act.reshape(-1, cz), *ln, None, weights)[1].reshape(-1, n, n)
+      live = _inside(jnp.any(msa_mask > 0, axis=0))
+      keep = [jnp.where(live[:, None] & live[None, :], 1, -1).astype(pair_act.dtype).reshape(-1)] if packed else []
+      nonbatched_bias = feat_2d(pair_act.reshape(-1, cz), *ln, None, weights, *keep)[1].reshape(-1, n, n)
     else:
       pair_act = common_modules.LayerNorm(
           axis=[-1],
@@ -1272,7 +1290,10 @@ class TriangleAttention(hk.Module):
     assert len(pair_mask.shape) == 2
     assert c.orientation in ['per_row', 'per_column']
 
-    attn_mod = Attention(c, self.global_config, pair_act.shape[-1])
+    # trim: the packed kernel skips the padded length, whose rows are masked downstream; only for a bucketed length,
+    # as it costs ~10% where the padding is a few rows
+    attn_mod = Attention(c, self.global_config, pair_act.shape[-1],
+                         trim=self.global_config.get('length_buckets', False))
     # The packed kernel attends along either axis in place, so it needs no transposed copies.
     packed = attn_mod.packed_kernel(pair_act) is not None
     column = c.orientation == 'per_column'
@@ -1294,7 +1315,7 @@ class TriangleAttention(hk.Module):
       # the query LayerNorm runs inside the kernel that projects q/k/v/gate and the bias
       ln = _layer_norm_params('query_norm', pair_act.shape[-1])
       return attn_mod.packed(pair_act, pair_mask, column=column, query_ln=ln, bias_w=weights, residual=residual,
-                             fp8=True)
+                             fp8=True, keep=pair_mask.reshape(-1))
 
     pair_act = common_modules.LayerNorm(
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
@@ -1302,7 +1323,8 @@ class TriangleAttention(hk.Module):
     nonbatched_bias = jnp.einsum('kqc,ch->hqk' if column and packed else 'qkc,ch->hqk', pair_act, weights)
 
     if packed:
-      return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column, residual=residual)
+      return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column, residual=residual,
+                             keep=pair_mask.reshape(-1))
     if attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
@@ -1844,17 +1866,20 @@ class TriangleMultiplication(hk.Module):
       proj, contract = fp8
       incoming = lhs == 'kjc'
       left_p, right_p = proj(act, *in_ln, p_w, p_b, g_w, g_b, mask, transpose=incoming)
-      tri = contract(*((right_p, left_p) if incoming else (left_p, right_p)))
+      a, b = (right_p, left_p) if incoming else (left_p, right_p)
+      tri = contract(a, b)
     else:
       left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, mask.reshape(-1))
+      left_p, right_p = left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1)
       move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
       # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
-      tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1))
+      tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p, right_p)
     ln = _layer_norm_params('center_norm', ci)
     out_p = _linear_params('output_projection', ci, cz, act.dtype, utils.final_init(gc))
     gate_p = _linear_params('gating_linear', cz, cz, act.dtype, utils.final_init(gc), bias_init=1.)
     epilogue = fused_ops.trimul_epilogue_ln(gc, act.dtype)
-    out = epilogue(tri.reshape(ci, -1), act.reshape(-1, cz), *in_ln, *ln, *out_p, *gate_p,
+    # keep: the padded length's rows skip the epilogue
+    out = epilogue(tri.reshape(ci, -1), act.reshape(-1, cz), *in_ln, *ln, *out_p, *gate_p, mask.reshape(-1),
                    add_input=residual is act).reshape(n0, n1, cz)
     return out if residual is None or residual is act else residual + out
 
@@ -1997,7 +2022,7 @@ class OuterProductMean(hk.Module):
 
     _ref = act
 
-    def compute_chunk(left_act):
+    def compute_chunk(left_act, right_act):
       # This is equivalent to
       #
       # act = jnp.einsum('abc,ade->dceb', left_act, right_act)
@@ -2011,10 +2036,10 @@ class OuterProductMean(hk.Module):
       return jnp.transpose(act, [1, 0, 2])
 
     if gc.get('use_pallas', False):
-      right_t = jnp.transpose(right_act, [0, 2, 1])               # [a, e, d], small
       w_flat = output_w.reshape(-1, self.num_output_channel)       # [(c e), f]
 
-      def compute_chunk(left_act):  # noqa: F811
+      def compute_chunk(left_act, right_t):  # noqa: F811
+        # right_t [a, e, d], transposed once per update
         # [b, c, e, d] is the first GEMM's natural output, and batching the second GEMM over b
         # reads it in place: no transpose of the [b, d, c*e] intermediate (1.5x on sm_120).
         act = utils.wide_einsum('abc,aed->bced', left_act, right_t)
@@ -2022,7 +2047,7 @@ class OuterProductMean(hk.Module):
         w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
-    def update(left_act, right_act, mask):
+    def update(left_act, right_act, mask, residual):
       if left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
         # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
         rows, d, _ = right_act.shape
@@ -2039,11 +2064,12 @@ class OuterProductMean(hk.Module):
         # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
         act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
       else:
+        right = jnp.transpose(right_act, [0, 2, 1]) if gc.get('use_pallas', False) else right_act
         act = mapping.inference_subbatch(
             compute_chunk,
             c.chunk_size,
             batched_args=[left_act],
-            nonbatched_args=[],
+            nonbatched_args=[right],
             low_memory=True,
             input_subbatch_dim=1,
             output_subbatch_dim=0)
@@ -2055,14 +2081,20 @@ class OuterProductMean(hk.Module):
 
       return act if residual is None else residual + act
 
-    rows, few = left_act.shape[0], OPM_REASSOCIATE_ROWS
-    if rows > few and gc.get('use_pallas', False):
+    if not gc.get('use_pallas', False):
+      return update(left_act, right_act, mask, residual)
+
+    def live_rows(left_act, right_act, mask, residual):
       # an MSA padded to its full depth: its padded rows trail the live ones, so while no more than `few` are live the
       # shallow update on the leading rows is the whole update (the fused kernel, or its one GEMM on legacy cards)
-      live = jnp.max(jnp.where(jnp.any(mask[..., 0] > 0, axis=-1), jnp.arange(rows) + 1, 0))
-      return hk.cond(live <= few, lambda: update(left_act[:few], right_act[:few], mask[:few]),
-                     lambda: update(left_act, right_act, mask))
-    return update(left_act, right_act, mask)
+      rows, few = left_act.shape[0], OPM_REASSOCIATE_ROWS
+      if rows <= few:
+        return update(left_act, right_act, mask, residual)
+      live = _live_length(jnp.any(mask[..., 0] > 0, axis=-1))
+      return hk.cond(live <= few, lambda: update(left_act[:few], right_act[:few], mask[:few], residual),
+                     lambda: update(left_act, right_act, mask, residual))
+
+    return live_rows(left_act, right_act, mask, residual)
 
 
 def dgram_from_positions(positions, num_bins, min_bin, max_bin):
@@ -2199,7 +2231,7 @@ class EvoformerIteration(hk.Module):
         safe_key=next(sub_keys))
 
     msa_act = dropout_wrapper_fn(
-        Transition(c.msa_transition, gc, name='msa_transition', skip_padding=True),
+        Transition(c.msa_transition, gc, name='msa_transition'),
         msa_act,
         msa_mask,
         safe_key=next(sub_keys))

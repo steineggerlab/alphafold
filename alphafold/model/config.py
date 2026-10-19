@@ -387,6 +387,8 @@ CONFIG = ml_collections.ConfigDict({
             'subbatch_size': 4,
             'use_remat': False,
             'use_pallas': False,
+            # the length is a bucket past the input: the triangle attention trims its padding
+            'length_buckets': False,
             'zero_init': True,
             'eval_dropout': False,
         },
@@ -630,6 +632,8 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
             'subbatch_size': 4,
             'use_remat': False,
             'use_pallas': False,
+            # the length is a bucket past the input: the triangle attention trims its padding
+            'length_buckets': False,
             'zero_init': True,
             'eval_dropout': False,
         },
