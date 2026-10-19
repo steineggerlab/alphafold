@@ -620,10 +620,12 @@ class Transition(hk.Module):
 
   takes_residual = True
 
-  def __init__(self, config, global_config, name='transition_block'):
+  def __init__(self, config, global_config, name='transition_block', skip_padding=False):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
+    # the fused kernel skips row blocks the mask leaves out (an MSA padded to its full depth)
+    self.skip_padding = skip_padding
 
   def __call__(self, act, mask, is_training=True, residual=None):
     """Builds Transition module.
@@ -648,9 +650,10 @@ class Transition(hk.Module):
       t1 = _linear_params('transition1', nc, num_intermediate, act.dtype, 'relu')
       t2 = _linear_params('transition2', num_intermediate, nc, act.dtype,
                           utils.final_init(self.global_config))
+      keep = [mask.reshape(-1)] if self.skip_padding else []
       if residual is act:
-        return fused(act, *ln, *t1, *t2, add_input=True)
-      out = fused(act, *ln, *t1, *t2)
+        return fused(act, *ln, *t1, *t2, *keep, add_input=True)
+      out = fused(act, *ln, *t1, *t2, *keep)
       return out if residual is None else residual + out
 
     act = common_modules.LayerNorm(
@@ -702,19 +705,22 @@ def _fp8_slots(global_config, dtype, key_dim, seq_len):
 class Attention(hk.Module):
   """Multihead attention."""
 
-  def __init__(self, config, global_config, output_dim, name='attention'):
+  def __init__(self, config, global_config, output_dim, name='attention', trim=False):
     super().__init__(name=name)
 
     self.config = config
     self.global_config = global_config
     self.output_dim = output_dim
+    # the packed kernel skips the rows and keys the mask leaves out, whose outputs are masked downstream (the MSA's)
+    self.trim = trim
 
   def packed_kernel(self, act):
     """The packed-projection kernel for self-attention on act, or None."""
     num_head = self.config.num_head
     key_dim = self.config.get('key_dim', int(act.shape[-1])) // num_head
     value_dim = self.config.get('value_dim', int(act.shape[-1])) // num_head
-    return fused_ops.packed_attention(self.global_config, act.dtype, key_dim, value_dim)
+    gc = {**self.global_config, 'trim_padding': True} if self.trim else self.global_config
+    return fused_ops.packed_attention(gc, act.dtype, key_dim, value_dim)
 
   def ln_projection_kernel(self, act):
     """The kernel that layer-norms act and projects q/k/v/gate and the pair bias, or None."""
@@ -722,7 +728,8 @@ class Attention(hk.Module):
     return fused_ops.ln_projection(self.global_config, act.dtype, int(act.shape[-1]),
                                    self.config.num_head * key_dim)
 
-  def packed(self, act, mask, nonbatched_bias=None, column=False, query_ln=None, bias_w=None, residual=None, fp8=False):
+  def packed(self, act, mask, nonbatched_bias=None, column=False, query_ln=None, bias_w=None, residual=None, fp8=False,
+             keep=None):
     """Self-attention over the rows of act [X, Y, a], or its columns when column.
 
     One GEMM projects q/k/v/gate, which the kernel reads in place: no transposes.
@@ -730,6 +737,7 @@ class Attention(hk.Module):
     query_ln (scale, offset) layer-norms the raw act inside the projection, which also gives the bias from bias_w [a, h]
     when given.
     residual [X, Y, output_dim] is added to the output. fp8 lets k and v go e4m3 where global_config.fp8 asks.
+    keep [X * Y]: the projections skip row blocks it leaves out.
     """
     X, Y, a = act.shape
     num_head = self.config.num_head
@@ -754,6 +762,7 @@ class Attention(hk.Module):
       # f8_scales only where given: colabfold-kernels before 0.7 has no such argument
       out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
+                                           *([] if keep is None else [keep]),
                                            f8_slots=f8_slots, **({} if f8_scales is None else {'f8_scales': f8_scales}))
       p, b = out[:2]
       p8 = out[2].reshape(X, Y, 2, num_head, key_dim) if f8 else None
@@ -779,6 +788,8 @@ class Attention(hk.Module):
     proj = fused_ops.output_projection(self.global_config, act.dtype, num_head * value_dim, self.output_dim)
     if proj is not None:
       res = [] if residual is None else [residual.reshape(X * Y, -1)]
+      if keep is not None:
+        res = (res or [None]) + [keep]
       return proj(out, o_weights, o_bias, *res).reshape(X, Y, self.output_dim)
     out = (jnp.dot(out, o_weights) + o_bias).reshape(X, Y, self.output_dim)
     return out if residual is None else residual + out
@@ -1051,7 +1062,7 @@ class MSARowAttentionWithPairBias(hk.Module):
     assert len(bias.shape) == 4
 
     attn_mod = Attention(
-        c, self.global_config, msa_act.shape[-1])
+        c, self.global_config, msa_act.shape[-1], trim=True)
     packed = attn_mod.packed_kernel(msa_act) is not None
     query_ln = None
     if packed and attn_mod.ln_projection_kernel(msa_act) is not None:
@@ -1084,7 +1095,8 @@ class MSARowAttentionWithPairBias(hk.Module):
       nonbatched_bias = jnp.einsum('qkc,ch->hqk', pair_act, weights)
 
     if packed:
-      return attn_mod.packed(msa_act, msa_mask, nonbatched_bias, query_ln=query_ln, residual=residual)
+      return attn_mod.packed(msa_act, msa_mask, nonbatched_bias, query_ln=query_ln, residual=residual,
+                             keep=msa_mask.reshape(-1))
     if attention_fused(self.global_config, c, msa_act):
       # Pallas flash attention doesn't materialize the [N,N] matrix
       # memory-saving subbatch chunking is unneeded
@@ -1134,7 +1146,7 @@ class MSAColumnAttention(hk.Module):
     assert len(msa_mask.shape) == 2
     assert c.orientation == 'per_column'
 
-    attn_mod = Attention(c, self.global_config, msa_act.shape[-1])
+    attn_mod = Attention(c, self.global_config, msa_act.shape[-1], trim=True)
     # The packed kernel attends down the columns in place, so it needs no transposed copies.
     packed = attn_mod.packed_kernel(msa_act) is not None
     if not packed:
@@ -1147,14 +1159,14 @@ class MSAColumnAttention(hk.Module):
     if packed and attn_mod.ln_projection_kernel(msa_act) is not None:
       # the query LayerNorm runs inside the kernel that projects q/k/v/gate
       ln = _layer_norm_params('query_norm', msa_act.shape[-1])
-      return attn_mod.packed(msa_act, msa_mask, column=True, query_ln=ln, residual=residual)
+      return attn_mod.packed(msa_act, msa_mask, column=True, query_ln=ln, residual=residual, keep=msa_mask.reshape(-1))
 
     msa_act = common_modules.LayerNorm(
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
             msa_act)
 
     if packed:
-      return attn_mod.packed(msa_act, msa_mask, column=True, residual=residual)
+      return attn_mod.packed(msa_act, msa_mask, column=True, residual=residual, keep=msa_mask.reshape(-1))
     if attention_fused(self.global_config, c, msa_act):
       msa_act = attn_mod(msa_act, msa_act, bias)
     else:
@@ -2010,37 +2022,47 @@ class OuterProductMean(hk.Module):
         w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
-    if left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
-      # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
-      rows, d, _ = right_act.shape
-      t = utils.wide_einsum('ade,cef->acdf', right_act, output_w).astype(act.dtype)
-      t = t.reshape(rows * output_w.shape[0], d * self.num_output_channel)
+    def update(left_act, right_act, mask):
+      if left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
+        # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
+        rows, d, _ = right_act.shape
+        t = utils.wide_einsum('ade,cef->acdf', right_act, output_w).astype(_ref.dtype)
+        t = t.reshape(rows * output_w.shape[0], d * self.num_output_channel)
 
-      lhs = jnp.transpose(left_act, [1, 0, 2]).reshape(left_act.shape[1], -1)
-      fused = fused_ops.opm_update(gc, act.dtype, lhs.shape[1], self.num_output_channel)
-      if fused is not None:
-        # the GEMM, bias, mask norm and residual in one pass: the [b, d*f] product is never written
-        norm = utils.wide_einsum('abc,adc->bdc', mask, mask)[..., 0]
-        res = [] if residual is None else [residual]
-        return fused(lhs, t.reshape(t.shape[0], d, -1), output_b, norm, *res)
-      # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
-      act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
-    else:
-      act = mapping.inference_subbatch(
-          compute_chunk,
-          c.chunk_size,
-          batched_args=[left_act],
-          nonbatched_args=[],
-          low_memory=True,
-          input_subbatch_dim=1,
-          output_subbatch_dim=0)
+        lhs = jnp.transpose(left_act, [1, 0, 2]).reshape(left_act.shape[1], -1)
+        fused = fused_ops.opm_update(gc, _ref.dtype, lhs.shape[1], self.num_output_channel)
+        if fused is not None:
+          # the GEMM, bias, mask norm and residual in one pass: the [b, d*f] product is never written
+          norm = utils.wide_einsum('abc,adc->bdc', mask, mask)[..., 0]
+          res = [] if residual is None else [residual]
+          return fused(lhs, t.reshape(t.shape[0], d, -1), output_b, norm, *res)
+        # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
+        act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
+      else:
+        act = mapping.inference_subbatch(
+            compute_chunk,
+            c.chunk_size,
+            batched_args=[left_act],
+            nonbatched_args=[],
+            low_memory=True,
+            input_subbatch_dim=1,
+            output_subbatch_dim=0)
 
-    epsilon = 1e-3
-    norm = utils.wide_einsum('abc,adc->bdc', mask, mask)
-    act /= epsilon + norm
-    act = act.astype(_ref.dtype)
+      epsilon = 1e-3
+      norm = utils.wide_einsum('abc,adc->bdc', mask, mask)
+      act /= epsilon + norm
+      act = act.astype(_ref.dtype)
 
-    return act if residual is None else residual + act
+      return act if residual is None else residual + act
+
+    rows, few = left_act.shape[0], OPM_REASSOCIATE_ROWS
+    if rows > few and gc.get('use_pallas', False):
+      # an MSA padded to its full depth: its padded rows trail the live ones, so while no more than `few` are live the
+      # shallow update on the leading rows is the whole update (the fused kernel, or its one GEMM on legacy cards)
+      live = jnp.max(jnp.where(jnp.any(mask[..., 0] > 0, axis=-1), jnp.arange(rows) + 1, 0))
+      return hk.cond(live <= few, lambda: update(left_act[:few], right_act[:few], mask[:few]),
+                     lambda: update(left_act, right_act, mask))
+    return update(left_act, right_act, mask)
 
 
 def dgram_from_positions(positions, num_bins, min_bin, max_bin):
@@ -2177,7 +2199,7 @@ class EvoformerIteration(hk.Module):
         safe_key=next(sub_keys))
 
     msa_act = dropout_wrapper_fn(
-        Transition(c.msa_transition, gc, name='msa_transition'),
+        Transition(c.msa_transition, gc, name='msa_transition', skip_padding=True),
         msa_act,
         msa_mask,
         safe_key=next(sub_keys))
