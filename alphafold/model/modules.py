@@ -31,6 +31,7 @@ from alphafold.model import utils
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 # Transitions aren't quadratic: chunk to a ~256 MiB intermediate, not 4 rows.
 # Only with fused kernels, where the launch count was measured: on plain XLA the
@@ -705,6 +706,14 @@ def glorot_uniform():
                                          distribution='uniform')
 
 
+def _hadamard(d):
+  """The orthonormal d x d Sylvester Hadamard matrix, d a power of two."""
+  h = np.ones((1, 1))
+  while h.shape[0] < d:
+    h = np.block([[h, h], [h, -h]])
+  return h / np.sqrt(d)
+
+
 def _fp8_slots(global_config, dtype, key_dim, seq_len):
   """(e4m3 slots, scales or None) the projection writes for the attention kernel that runs, or None.
 
@@ -774,6 +783,10 @@ class Attention(hk.Module):
       # the projection writes the slots the attention kernel reads in e4m3, with their scales
       f8 = fp8 and _fp8_slots(self.global_config, act.dtype, key_dim, X if column else Y)
       f8_slots, f8_scales = f8 or ((), None)
+      if 1 in f8_slots and key_dim & (key_dim - 1) == 0:
+        # q and k rotated by one Hadamard per head: the logits are as before, the outliers e4m3 rounds spread out
+        rot = jnp.einsum('asht,tu->ashu', w[:, :2].astype(jnp.float32), _hadamard(key_dim)).astype(w.dtype)
+        w = jnp.concatenate([rot, w[:, 2:]], axis=1)
       # f8_scales only where given: colabfold-kernels before 0.7 has no such argument
       out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
