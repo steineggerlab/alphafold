@@ -2217,6 +2217,10 @@ class EvoformerIteration(hk.Module):
         msa_mask,
         safe_key=next(sub_keys),
         pair_act=pair_act)
+    if gc.get('use_pallas', False):
+      # the pair's next writers update it in place (aliased kernels): ordered after the row attention's read of it,
+      # XLA needs no copy of the pair to keep that read's input
+      pair_act, msa_act = jax.lax.optimization_barrier((pair_act, msa_act))
 
     if not self.is_extra_msa:
       attn_mod = MSAColumnAttention(
