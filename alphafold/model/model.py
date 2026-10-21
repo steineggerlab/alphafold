@@ -31,12 +31,12 @@ from alphafold.model.tf import np_backend as tf
 import tree
 
 
-# keep coordinates in fp32 to keep backbone bond precision; one dispatch for the whole tree
-@jax.jit
+# keep coordinates in fp32 to keep backbone bond precision; inside the model's jit so each fp32 output is freed once cast,
+# behind a barrier so the convert does not fuse into its producer and change its rounding
 def _cast_result(result):
   coords = jax.tree_util.DictKey("final_atom_positions")
   return jax.tree_util.tree_map_with_path(
-      lambda path, v: v.astype(jnp.float32 if path[-1] == coords else jnp.float16), result)
+      lambda path, v: jax.lax.optimization_barrier(v).astype(jnp.float32 if path[-1] == coords else jnp.float16), result)
 
 
 @functools.partial(jax.jit, static_argnames=("size",))
@@ -84,7 +84,8 @@ class RunModel:
               ensemble_representations=True)
 
     jit_kwargs = jit_kwargs or {}
-    self.apply = jax.jit(hk.transform(_forward_fn).apply, **jit_kwargs)
+    apply = hk.transform(_forward_fn).apply
+    self.apply = jax.jit(lambda params, key, batch: _cast_result(apply(params, key, batch)), **jit_kwargs)
     self.init = jax.jit(hk.transform(_forward_fn).init, **jit_kwargs)
 
   def init_params(self, feat: features.FeatureDict, random_seed: int = 0):
@@ -190,7 +191,7 @@ class RunModel:
     prev = jax.device_put(prev)
 
     def run(key, feat, prev):
-      result = _cast_result(self.apply(self.params, key, {**feat, "prev": prev}))
+      result = self.apply(self.params, key, {**feat, "prev": prev})
       prev = result.pop("prev")
       return _fetch_small(result), prev
 
