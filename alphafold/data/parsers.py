@@ -20,6 +20,8 @@ import re
 import string
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
+import numpy as np
+
 # Internal import (7716).
 
 
@@ -154,6 +156,38 @@ def parse_stockholm(stockholm_string: str) -> Msa:
              descriptions=list(name_to_sequence.keys()))
 
 
+def _a3m_deletions_loop(sequences):
+  deletion_matrix = []
+  for msa_sequence in sequences:
+    deletion_vec = []
+    deletion_count = 0
+    for j in msa_sequence:
+      if j.islower():
+        deletion_count += 1
+      else:
+        deletion_vec.append(deletion_count)
+        deletion_count = 0
+    deletion_matrix.append(deletion_vec)
+  return deletion_matrix
+
+
+def _a3m_deletions(sequences):
+  """Each row's lowercase run before each of its aligned columns, all rows in one pass (rows end at a newline)."""
+  joined = '\n'.join(sequences) + '\n'
+  if not sequences or not joined.isascii():
+    return _a3m_deletions_loop(sequences)
+  b = np.frombuffer(joined.encode('ascii'), np.uint8)
+  lower = (b >= ord('a')) & (b <= ord('z'))
+  aligned = np.flatnonzero(~lower)
+  counts = np.diff(np.cumsum(lower)[aligned], prepend=0)
+  # a row's newline closes it and carries its trailing insertions, which no column takes
+  ends = np.flatnonzero(b[aligned] == ord('\n'))
+  widths = np.diff(ends, prepend=-1) - 1
+  if (widths == widths[0]).all():
+    return counts.reshape(len(sequences), widths[0] + 1)[:, :-1]
+  return [row[:-1] for row in np.split(counts, ends[:-1] + 1)]
+
+
 def parse_a3m(a3m_string: str) -> Msa:
   """Parses sequences and deletion matrix from a3m format alignment.
 
@@ -171,17 +205,7 @@ def parse_a3m(a3m_string: str) -> Msa:
       * A list of descriptions, one per sequence, from the a3m file.
   """
   sequences, descriptions = parse_fasta(a3m_string)
-  deletion_matrix = []
-  for msa_sequence in sequences:
-    deletion_vec = []
-    deletion_count = 0
-    for j in msa_sequence:
-      if j.islower():
-        deletion_count += 1
-      else:
-        deletion_vec.append(deletion_count)
-        deletion_count = 0
-    deletion_matrix.append(deletion_vec)
+  deletion_matrix = _a3m_deletions(sequences)
 
   # Make the MSA matrix out of aligned (deletion-free) sequences.
   deletion_table = str.maketrans('', '', string.ascii_lowercase)
