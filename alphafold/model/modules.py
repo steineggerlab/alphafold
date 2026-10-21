@@ -2060,8 +2060,10 @@ class OuterProductMean(hk.Module):
         w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
-    def update(left_act, right_act, mask, residual):
-      if left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
+    def update(left_act, right_act, mask, residual, reassociate=True):
+      outer = None if reassociate or not hasattr(fused_ops, 'opm_outer') else fused_ops.opm_outer(
+          gc, _ref.dtype, left_act.shape[0], right_act.shape[-1], right_act.shape[1], self.num_output_channel)
+      if reassociate and left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
         # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
         rows, d, _ = right_act.shape
         t = utils.wide_einsum('ade,cef->acdf', right_act, output_w).astype(_ref.dtype)
@@ -2076,6 +2078,9 @@ class OuterProductMean(hk.Module):
           return fused(lhs, t.reshape(t.shape[0], d, -1), output_b, norm, *res)
         # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
         act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
+      elif outer is not None:
+        # the same two GEMMs in one kernel, their [b, c*e, d] product never written
+        act = outer(left_act, right_act, w_flat) + output_b
       else:
         right = jnp.transpose(right_act, [0, 2, 1]) if gc.get('use_pallas', False) else right_act
         act = mapping.inference_subbatch(
@@ -2099,12 +2104,12 @@ class OuterProductMean(hk.Module):
 
     def live_rows(left_act, right_act, mask, residual):
       # an MSA padded to its full depth: its padded rows trail the live ones, so while no more than `few` are live the
-      # shallow update on the leading rows is the whole update (the fused kernel, or its one GEMM on legacy cards)
+      # update on the leading rows is the whole update, in the full depth's order (its padded rows only add zeros)
       rows, few = left_act.shape[0], OPM_REASSOCIATE_ROWS
       if rows <= few:
         return update(left_act, right_act, mask, residual)
       live = _live_length(jnp.any(mask[..., 0] > 0, axis=-1))
-      return hk.cond(live <= few, lambda: update(left_act[:few], right_act[:few], mask[:few], residual),
+      return hk.cond(live <= few, lambda: update(left_act[:few], right_act[:few], mask[:few], residual, False),
                      lambda: update(left_act, right_act, mask, residual))
 
     return live_rows(left_act, right_act, mask, residual)
