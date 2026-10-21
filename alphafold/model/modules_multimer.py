@@ -364,7 +364,9 @@ class AlphaFoldIteration(hk.Module):
     structure_module_output = None
     if 'entity_id' in batch and 'all_atom_positions' in batch:
       _, fold_module = self.heads['structure_module']
-      structure_module_output = fold_module(representations, batch, is_training)
+      # float32 dots at highest precision: at the default, a Triton GEMM misfolded a homodimer (26 A, pLDDT 74 vs 84)
+      with jax.default_matmul_precision('highest'):
+        structure_module_output = fold_module(representations, batch, is_training)
 
     ret = {}
     ret['representations'] = representations
