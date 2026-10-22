@@ -714,17 +714,6 @@ def _hadamard(d):
   return h / np.sqrt(d)
 
 
-def _fp8_slots(global_config, dtype, key_dim, seq_len):
-  """(e4m3 slots, scales or None) the projection writes for the attention kernel that runs, or None.
-
-  colabfold-kernels 0.7 picks per kernel (Mosaic GPU on sm_120 takes q, pre-scaled, and k); before it, Triton's k and v.
-  """
-  slots = getattr(fused_ops, 'fp8_attention_slots', None)
-  if slots is not None:
-    return slots(global_config, dtype, key_dim, seq_len)
-  return ((1, 2), None) if fused_ops.fp8_attention(global_config, key_dim) else None
-
-
 class Attention(hk.Module):
   """Multihead attention."""
 
@@ -781,17 +770,16 @@ class Attention(hk.Module):
       p = jnp.dot(act.reshape(-1, a), w.reshape(a, -1))
     else:
       # the projection writes the slots the attention kernel reads in e4m3, with their scales
-      f8 = fp8 and _fp8_slots(self.global_config, act.dtype, key_dim, X if column else Y)
+      f8 = fp8 and fused_ops.fp8_attention_slots(self.global_config, act.dtype, key_dim, X if column else Y)
       f8_slots, f8_scales = f8 or ((), None)
       if 1 in f8_slots and key_dim & (key_dim - 1) == 0:
         # q and k rotated by one Hadamard per head: the logits are as before, the outliers e4m3 rounds spread out
         rot = jnp.einsum('asht,tu->ashu', w[:, :2].astype(jnp.float32), _hadamard(key_dim)).astype(w.dtype)
         w = jnp.concatenate([rot, w[:, 2:]], axis=1)
-      # f8_scales only where given: colabfold-kernels before 0.7 has no such argument
       out = self.ln_projection_kernel(act)(act.reshape(-1, a), *query_ln,
                                            jnp.moveaxis(w, 1, 0).reshape(-1, a, num_head * key_dim), bias_w,
                                            *([] if keep is None else [_region_keep(mask) if self.trim else keep]),
-                                           f8_slots=f8_slots, **({} if f8_scales is None else {'f8_scales': f8_scales}))
+                                           f8_slots=f8_slots, f8_scales=f8_scales)
       p, b = out[:2]
       p8 = out[2].reshape(X, Y, 2, num_head, key_dim) if f8 else None
       if bias_w is not None:
@@ -2061,7 +2049,7 @@ class OuterProductMean(hk.Module):
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
     def update(left_act, right_act, mask, residual, reassociate=True):
-      outer = None if reassociate or not hasattr(fused_ops, 'opm_outer') else fused_ops.opm_outer(
+      outer = None if reassociate else fused_ops.opm_outer(
           gc, _ref.dtype, left_act.shape[0], right_act.shape[-1], right_act.shape[1], self.num_output_channel)
       if reassociate and left_act.shape[0] <= OPM_REASSOCIATE_ROWS:
         # few rows: fold the output weights into the right side first, then one GEMM over (rows, channels)
