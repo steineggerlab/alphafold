@@ -46,11 +46,30 @@ def _slice_recycle(feat, start, size):
   return jax.tree_util.tree_map(lambda x: jax.lax.dynamic_slice_in_dim(x, start, size), feat)
 
 
-def _fetch_small(tree, limit=1 << 20):
-  """tree with its leaves up to limit bytes on the host, in one transfer; the [L, L, 64] logits stay on device."""
+_SMALL = 1 << 20
+
+
+def _pack_small(result):
+  """result plus "_small": the bytes of its leaves up to _SMALL (prev's stay for the next recycle), concatenated, so
+  _fetch_small takes them in one transfer instead of one blocking copy each."""
+  small = [x for x in jax.tree_util.tree_leaves({k: v for k, v in result.items() if k != "prev"})
+           if x.size * x.dtype.itemsize <= _SMALL]
+  packed = [jax.lax.bitcast_convert_type(x, jnp.uint8).reshape(-1) for x in small]
+  return {**result, "_small": jnp.concatenate(packed) if packed else jnp.zeros((0,), jnp.uint8)}
+
+
+def _fetch_small(tree):
+  """tree with its leaves up to _SMALL on the host, from _pack_small's buffer; the [L, L, 64] logits stay on device."""
+  buf = np.asarray(tree.pop("_small"))
   leaves, treedef = jax.tree_util.tree_flatten(tree)
-  small = iter(jax.device_get([x for x in leaves if x.nbytes <= limit]))
-  return treedef.unflatten([next(small) if x.nbytes <= limit else x for x in leaves])
+  out, off = [], 0
+  for x in leaves:
+    if x.nbytes <= _SMALL:
+      out.append(np.frombuffer(buf, x.dtype, x.size, off).reshape(x.shape).copy())
+      off += x.nbytes
+    else:
+      out.append(x)
+  return treedef.unflatten(out)
 
 
 class RunModel:
@@ -86,7 +105,7 @@ class RunModel:
 
     jit_kwargs = jit_kwargs or {}
     apply = hk.transform(_forward_fn).apply
-    self.apply = jax.jit(lambda params, key, batch: _cast_result(apply(params, key, batch)), **jit_kwargs)
+    self.apply = jax.jit(lambda params, key, batch: _pack_small(_cast_result(apply(params, key, batch))), **jit_kwargs)
     self.init = jax.jit(hk.transform(_forward_fn).init, **jit_kwargs)
 
   def init_params(self, feat: features.FeatureDict, random_seed: int = 0):
