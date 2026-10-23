@@ -69,7 +69,8 @@ class InvariantPointAttention(hk.Module):
 
     self.global_config = global_config
 
-  def __call__(self, inputs_1d, inputs_2d, mask, affine):
+  def __call__(self, inputs_1d, inputs_2d, mask, affine, pair_bias=None,
+               only_bias=False):
     """Compute geometry-aware attention.
 
     Given a set of query residues (defined by affines and associated scalar
@@ -96,6 +97,12 @@ class InvariantPointAttention(hk.Module):
     Returns:
       Transformation of the input embedding.
     """
+    if only_bias:
+      attention_2d = common_modules.Linear(
+          self.config.num_head, name='attention_2d')(
+              inputs_2d)
+      return np.sqrt(1.0 / 3) * jnp.transpose(attention_2d, [2, 0, 1])
+
     num_residues, _ = inputs_1d.shape
 
     # Improve readability by removing a large number of 'self's.
@@ -206,13 +213,9 @@ class InvariantPointAttention(hk.Module):
     attn_qk_scalar = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
     attn_logits = attn_qk_scalar + attn_qk_point
 
-    attention_2d = common_modules.Linear(
-        num_head, name='attention_2d')(
-            inputs_2d)
-
-    attention_2d = jnp.transpose(attention_2d, [2, 0, 1])
-    attention_2d = attention_2d_weights * attention_2d
-    attn_logits += attention_2d
+    if pair_bias is None:
+      pair_bias = self(None, inputs_2d, None, None, only_bias=True)
+    attn_logits += pair_bias
 
     mask_2d = mask * jnp.swapaxes(mask, -1, -2)
     attn_logits -= 1e5 * (1. - mask_2d)
@@ -297,14 +300,28 @@ class FoldIteration(hk.Module):
 
   def __call__(self,
                activations,
-               sequence_mask,
-               update_affine,
-               is_training,
-               initial_act,
+               sequence_mask=None,
+               update_affine=True,
+               is_training=False,
+               initial_act=None,
                safe_key=None,
                static_feat_2d=None,
-               aatype=None):
+               aatype=None,
+               pair_bias=None,
+               compute_sidechains=True,
+               mode=None):
     c = self.config
+    if not hasattr(self, '_ipa'):
+      self._ipa = InvariantPointAttention(self.config, self.global_config)
+    if mode == 'bias':
+      return self._ipa(None, static_feat_2d, None, None, only_bias=True)
+    if mode == 'sidechain':
+      if not hasattr(self, '_sc'):
+        self._sc = MultiRigidSidechain(c.sidechain, self.global_config)
+      affine = quat_affine.QuatAffine.from_tensor(activations['affine'])
+      return self._sc(
+          affine.scale_translation(c.position_scale),
+          [activations['act'], initial_act], aatype)
 
     if safe_key is None:
       safe_key = prng.SafeKey(hk.next_rng_key())
@@ -320,13 +337,13 @@ class FoldIteration(hk.Module):
     affine = quat_affine.QuatAffine.from_tensor(activations['affine'])
 
     act = activations['act']
-    attention_module = InvariantPointAttention(self.config, self.global_config)
     # Attention
-    attn = attention_module(
+    attn = self._ipa(
         inputs_1d=act,
         inputs_2d=static_feat_2d,
         mask=sequence_mask,
-        affine=affine)
+        affine=affine,
+        pair_bias=pair_bias)
     act += attn
     safe_key, *sub_keys = safe_key.split(3)
     sub_keys = iter(sub_keys)
@@ -373,10 +390,14 @@ class FoldIteration(hk.Module):
 
       affine = affine.pre_compose(affine_update)
 
-    sc = MultiRigidSidechain(c.sidechain, self.global_config)(
-        affine.scale_translation(c.position_scale), [act, initial_act], aatype)
-
-    outputs = {'affine': affine.to_tensor(), 'sc': sc}
+    if compute_sidechains:
+      if not hasattr(self, '_sc'):
+        self._sc = MultiRigidSidechain(c.sidechain, self.global_config)
+      sc = self._sc(
+          affine.scale_translation(c.position_scale), [act, initial_act], aatype)
+      outputs = {'affine': affine.to_tensor(), 'sc': sc}
+    else:
+      outputs = {}
 
     affine = affine.apply_rotation_tensor_fn(jax.lax.stop_gradient)
 
@@ -388,7 +409,7 @@ class FoldIteration(hk.Module):
 
 
 def generate_affines(representations, batch, config, global_config,
-                     is_training, safe_key):
+                     is_training, safe_key, compute_loss=True):
   """Generate predicted affines for a single chain.
 
   Jumper et al. (2021) Suppl. Alg. 20 "StructureModule"
@@ -440,7 +461,8 @@ def generate_affines(representations, batch, config, global_config,
       name='pair_layer_norm')(
           representations['pair'])
 
-  outputs = []
+  pair_bias = fold_iteration(None, static_feat_2d=act_2d, mode='bias')
+  all_steps = compute_loss or hk.running_init()
 
   def fold_iter(act, key):
       act, out = fold_iteration(
@@ -451,11 +473,21 @@ def generate_affines(representations, batch, config, global_config,
           sequence_mask=sequence_mask,
           update_affine=True,
           is_training=is_training,
-          aatype=batch['aatype'])
+          aatype=batch['aatype'],
+          pair_bias=pair_bias,
+          compute_sidechains=all_steps)
       return act, out
 
   keys = jax.random.split(safe_key.get(), c.num_layer)
   activations, output = hk.scan(fold_iter, activations, keys)
+  if not all_steps:
+    sc = fold_iteration(
+        activations, initial_act=initial_act, aatype=batch['aatype'],
+        mode='sidechain')
+    output = {
+        'affine': activations['affine'][None],
+        'sc': jax.tree_util.tree_map(lambda x: x[None], sc),
+    }
   output['act'] = activations['act']
 
   return output
@@ -488,7 +520,8 @@ class StructureModule(hk.Module):
         config=self.config,
         global_config=self.global_config,
         is_training=is_training,
-        safe_key=safe_key)
+        safe_key=safe_key,
+        compute_loss=self.compute_loss)
 
     ret['representations'] = {'structure_module': output['act']}
 
