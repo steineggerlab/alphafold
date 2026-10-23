@@ -1328,8 +1328,9 @@ class TriangleAttention(hk.Module):
       # without trim every row shares the key mask: one row's mask broadcast; trim reads the padded rows as empty
       km = pair_mask if attn_mod.trim else jnp.broadcast_to(pair_mask.max(axis=1 if column else 0, keepdims=True),
                                                             pair_mask.shape)
+      # keep, like trim, only for a bucketed length: a few padded rows skip no block, and the branch costs every one
       return attn_mod.packed(pair_act, km, column=column, query_ln=ln, bias_w=weights, residual=residual,
-                             fp8=True, keep=pair_mask.reshape(-1))
+                             fp8=True, keep=pair_mask.reshape(-1) if attn_mod.trim else None)
 
     pair_act = common_modules.LayerNorm(
         axis=[-1], create_scale=True, create_offset=True, name='query_norm')(
@@ -1338,7 +1339,7 @@ class TriangleAttention(hk.Module):
 
     if packed:
       return attn_mod.packed(pair_act, pair_mask, nonbatched_bias, column=column, residual=residual,
-                             keep=pair_mask.reshape(-1))
+                             keep=pair_mask.reshape(-1) if attn_mod.trim else None)
     if attention_fused(self.global_config, c, pair_act):
       pair_act = attn_mod(pair_act, pair_act, bias, nonbatched_bias)
     else:
