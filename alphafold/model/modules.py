@@ -47,15 +47,16 @@ def _live_length(alive):
   return jnp.max(jnp.where(alive, jnp.arange(alive.shape[0]) + 1, 0))
 
 
-def _inside(alive, align=128):
-  """alive [N] -> the leading positions up to its last live one, rounded up to align: what a trimmed attention reads."""
+def _inside(alive, align=64):
+  """alive [N] -> the leading positions up to its last live one, rounded up to align: what a trimmed attention reads
+  (its key blocks; queries past the last live one it zeros itself)."""
   return jnp.arange(alive.shape[0]) < -(-_live_length(alive) // align) * align
 
 
-def _region_keep(mask):
+def _region_keep(mask, align=64):
   """mask [X, Y] flattened as a projection's keep, below zero past its live rows and columns (rounded up to the
   attention's tiles): that projection writes nothing there, as the trimmed attention it feeds reads nothing there."""
-  inside = _inside(jnp.any(mask > 0, axis=1))[:, None] & _inside(jnp.any(mask > 0, axis=0))[None, :]
+  inside = _inside(jnp.any(mask > 0, axis=1), align)[:, None] & _inside(jnp.any(mask > 0, axis=0), align)[None, :]
   return jnp.where(inside, mask, -1).astype(mask.dtype).reshape(-1)
 
 
