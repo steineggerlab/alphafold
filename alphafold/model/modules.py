@@ -54,8 +54,8 @@ def _inside(alive, align=64):
 
 
 def _region_keep(mask, align=64):
-  """mask [X, Y] flattened as a projection's keep, below zero past its live rows and columns (rounded up to the
-  attention's tiles): that projection writes nothing there, as the trimmed attention it feeds reads nothing there."""
+  """mask [X, Y] flattened as a projection's keep, below zero past its live rows and columns (rounded up to align):
+  that projection writes nothing there, as what it feeds (a trimmed attention, the live contraction) reads nothing."""
   inside = _inside(jnp.any(mask > 0, axis=1), align)[:, None] & _inside(jnp.any(mask > 0, axis=0), align)[None, :]
   return jnp.where(inside, mask, -1).astype(mask.dtype).reshape(-1)
 
@@ -1877,19 +1877,32 @@ class TriangleMultiplication(hk.Module):
     g_w, g_b = _linear_params('gate', cz, 2 * ci, act.dtype, utils.final_init(gc), bias_init=1.)
     lhs, rhs = c.equation.split('->')[0].split(',')
     fp8 = fused_ops.fp8_contraction(gc, act.dtype, cz, ci, n1)
+    incoming = lhs == 'kjc'
+    # a bucketed length: the contraction runs over the live length only, so the projection writes nothing past it
+    live_con = fused_ops.live_contraction(gc, act.dtype) if fp8 is None and gc.get('length_buckets', False) else None
+    if live_con is not None:
+      live_contract, align = live_con
+      live = jnp.maximum(_live_length(jnp.any(mask > 0, axis=1)), _live_length(jnp.any(mask > 0, axis=0)))
+      proj_mask = _region_keep(mask, align).reshape(mask.shape)
+    else:
+      proj_mask = mask
     if fp8 is not None:
       # e4m3 operands contracted along their last axis, cuBLASLt's FP8 form: incoming edges read the pair transposed
       proj, contract = fp8
-      incoming = lhs == 'kjc'
       left_p, right_p = proj(act, *in_ln, p_w, p_b, g_w, g_b, mask, transpose=incoming)
       a, b = (right_p, left_p) if incoming else (left_p, right_p)
       tri = contract(a, b)
     else:
-      left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, mask.reshape(-1))
+      left_p, right_p = ln_gdp(act.reshape(-1, cz), *in_ln, p_w, p_b, g_w, g_b, proj_mask.reshape(-1))
       left_p, right_p = left_p.reshape(ci, n0, n1), right_p.reshape(ci, n0, n1)
       move = lambda t: t[-1] + t[:-1]          # 'ikc' -> 'cik'
-      # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
-      tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p, right_p)
+      if live_con is not None:
+        # incoming 'ckj,cki->cij': right's [c, k, i] is the left operand
+        tri = (live_contract(right_p, left_p, live, incoming=True) if incoming
+               else live_contract(left_p, right_p, live))
+      else:
+        # Sum over N overflows fp16: accumulate in fp32, back to half after LN.
+        tri = utils.wide_einsum(f'{move(lhs)},{move(rhs)}->cij', left_p, right_p)
     ln = _layer_norm_params('center_norm', ci)
     out_p = _linear_params('output_projection', ci, cz, act.dtype, utils.final_init(gc))
     gate_p = _linear_params('gating_linear', cz, cz, act.dtype, utils.final_init(gc), bias_init=1.)
