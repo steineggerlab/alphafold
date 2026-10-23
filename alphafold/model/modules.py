@@ -666,6 +666,22 @@ class Transition(hk.Module):
           name='input_layer_norm')(
               act)
 
+    sub = transition_subbatch(self.global_config, act.shape,
+                              num_intermediate, act.dtype)
+    if (sub >= act.shape[0] and not is_training
+        and self.global_config.get('use_pallas', False)
+        and act.shape[0] * act.shape[1] > 16_384):
+      w1, b1 = _linear_params('transition1', nc, num_intermediate, act.dtype, 'relu')
+      w2, b2 = _linear_params('transition2', num_intermediate, nc, act.dtype,
+                              utils.final_init(self.global_config))
+      h = jax.lax.cond(
+          mask.reshape(-1)[0] >= -1,
+          lambda z: jax.nn.relu(jnp.einsum('...a,ah->...h', z[0], z[1]) + z[2]),
+          lambda z: jnp.zeros(z[0].shape[:-1] + (num_intermediate,), z[0].dtype),
+          (act, w1, b1))
+      act = jnp.einsum('...a,ah->...h', h, w2) + b2
+      return act if residual is None else residual + act
+
     transition_module = hk.Sequential([
         common_modules.Linear(
             num_intermediate,
@@ -678,8 +694,6 @@ class Transition(hk.Module):
             name='transition2')
     ])
 
-    sub = transition_subbatch(self.global_config, act.shape,
-                              num_intermediate, act.dtype)
     if sub >= act.shape[0] and not is_training:
       act = transition_module(act)
     else:
