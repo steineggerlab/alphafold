@@ -36,7 +36,7 @@ import numpy as np
 # Transitions aren't quadratic: chunk to a ~256 MiB intermediate, not 4 rows.
 # Only with fused kernels, where the launch count was measured: on plain XLA the
 # wider chunk makes it pick fusions that want more shared memory than RDNA has.
-_TRANSITION_BUDGET_BYTES = 256 * 1024 * 1024
+_TRANSITION_BUDGET_BYTES = 512 * 1024 * 1024
 
 # Up to this many MSA rows the outer product mean folds its output weights into the right side, then contracts rows and
 # channels in one GEMM: fewer FLOPs below 32 rows (num_outer_channel); on gfx1151 2-5x faster to 16, even at 32.
@@ -682,20 +682,25 @@ class Transition(hk.Module):
         common_modules.Linear(
             num_intermediate,
             initializer='relu',
-            name='transition1'), jax.nn.relu,
+            name='transition1'),
+        lambda x: jax.lax.optimization_barrier(jax.nn.relu(x)),
         common_modules.Linear(
             nc,
             initializer=utils.final_init(self.global_config),
             name='transition2')
     ])
 
-    act = mapping.inference_subbatch(
-        transition_module,
-        transition_subbatch(self.global_config, act.shape,
-                            num_intermediate, act.dtype),
-        batched_args=[act],
-        nonbatched_args=[],
-        low_memory=not is_training)
+    sub = transition_subbatch(self.global_config, act.shape,
+                              num_intermediate, act.dtype)
+    if sub >= act.shape[0] and not is_training:
+      act = transition_module(act)
+    else:
+      act = mapping.inference_subbatch(
+          transition_module,
+          sub,
+          batched_args=[act],
+          nonbatched_args=[],
+          low_memory=not is_training)
 
     return act if residual is None else residual + act
 
@@ -791,7 +796,8 @@ class Attention(hk.Module):
       mask = mask.T
     s = mask.shape[1]
     kmask = utils.mask_to_bias(mask, act.dtype) > -1e3
-    if nonbatched_bias is None:
+    # no bias: the Pallas kernels skip it, the sm_70/75 kernels read zeros
+    if nonbatched_bias is None and fused_ops._legacy_cc(self.global_config) is not None:
       nonbatched_bias = jnp.zeros((num_head, s, s), act.dtype)
     out = self.packed_kernel(act)(p, nonbatched_bias, kmask, gate_bias, *([] if p8 is None else [p8]),
                                   sm_scale=key_dim**(-0.5), column=column)
@@ -1248,12 +1254,16 @@ class MSAColumnGlobalAttention(hk.Module):
     # [N_seq, N_res, 1]
     msa_mask = jnp.expand_dims(msa_mask, axis=-1)
     # chunks to the transition's budget (gate, output and their f32 temporaries), not 4 columns: 60k launches a fold
-    msa_act = mapping.inference_subbatch(
-        attn_mod,
-        transition_subbatch(self.global_config, msa_act.shape, 4 * msa_act.shape[-1], msa_act.dtype),
-        batched_args=[msa_act, msa_act, msa_mask],
-        nonbatched_args=[],
-        low_memory=not is_training)
+    sub = transition_subbatch(self.global_config, msa_act.shape, 4 * msa_act.shape[-1], msa_act.dtype)
+    if sub >= msa_act.shape[0] and not is_training:
+      msa_act = attn_mod(msa_act, msa_act, msa_mask)
+    else:
+      msa_act = mapping.inference_subbatch(
+          attn_mod,
+          sub,
+          batched_args=[msa_act, msa_act, msa_mask],
+          nonbatched_args=[],
+          low_memory=not is_training)
 
     msa_act = jnp.swapaxes(msa_act, -2, -3)
 
@@ -1315,7 +1325,10 @@ class TriangleAttention(hk.Module):
     if packed and attn_mod.ln_projection_kernel(pair_act) is not None:
       # the query LayerNorm runs inside the kernel that projects q/k/v/gate and the bias
       ln = _layer_norm_params('query_norm', pair_act.shape[-1])
-      return attn_mod.packed(pair_act, pair_mask, column=column, query_ln=ln, bias_w=weights, residual=residual,
+      # without trim every row shares the key mask: one row's mask broadcast; trim reads the padded rows as empty
+      km = pair_mask if attn_mod.trim else jnp.broadcast_to(pair_mask.max(axis=1 if column else 0, keepdims=True),
+                                                            pair_mask.shape)
+      return attn_mod.packed(pair_act, km, column=column, query_ln=ln, bias_w=weights, residual=residual,
                              fp8=True, keep=pair_mask.reshape(-1))
 
     pair_act = common_modules.LayerNorm(
@@ -1991,19 +2004,27 @@ class OuterProductMean(hk.Module):
     c = self.config
 
     mask = mask[..., None]
-    act = common_modules.LayerNorm([-1], True, True, name='layer_norm_input')(act)
+    _ref = act
+    opm_proj = fused_ops.opm_projection(gc, act.dtype, int(act.shape[-1]), c.num_outer_channel)
+    if opm_proj is not None:
+      ln = _layer_norm_params('layer_norm_input', int(act.shape[-1]))
+      lp = _linear_params('left_projection', int(act.shape[-1]), c.num_outer_channel, act.dtype, 'linear')
+      rp = _linear_params('right_projection', int(act.shape[-1]), c.num_outer_channel, act.dtype, 'linear')
+      left_act, right_act = opm_proj(act, *ln, *lp, *rp, mask[..., 0])
+    else:
+      act = common_modules.LayerNorm([-1], True, True, name='layer_norm_input')(act)
 
-    left_act = mask * common_modules.Linear(
-        c.num_outer_channel,
-        initializer='linear',
-        name='left_projection')(
-            act)
+      left_act = mask * common_modules.Linear(
+          c.num_outer_channel,
+          initializer='linear',
+          name='left_projection')(
+              act)
 
-    right_act = mask * common_modules.Linear(
-        c.num_outer_channel,
-        initializer='linear',
-        name='right_projection')(
-            act)
+      right_act = mask * common_modules.Linear(
+          c.num_outer_channel,
+          initializer='linear',
+          name='right_projection')(
+              act)
 
     if gc.zero_init:
       init_w = hk.initializers.Constant(0.0)
@@ -2020,8 +2041,6 @@ class OuterProductMean(hk.Module):
         'output_b', shape=(self.num_output_channel,),
         dtype=act.dtype,
         init=hk.initializers.Constant(0.0))
-
-    _ref = act
 
     def compute_chunk(left_act, right_act):
       # This is equivalent to
@@ -2071,14 +2090,20 @@ class OuterProductMean(hk.Module):
         act = outer(left_act, right_act, w_flat) + output_b
       else:
         right = jnp.transpose(right_act, [0, 2, 1]) if gc.get('use_pallas', False) else right_act
-        act = mapping.inference_subbatch(
-            compute_chunk,
-            c.chunk_size,
-            batched_args=[left_act],
-            nonbatched_args=[right],
-            low_memory=True,
-            input_subbatch_dim=1,
-            output_subbatch_dim=0)
+        # with the fast kernels, chunks only as the intermediate outgrows the transition budget
+        sub = (transition_subbatch(gc, (left_act.shape[1], left_act.shape[1], 1), c.num_outer_channel ** 2,
+                                   jnp.float32) if gc.get('use_pallas', False) else c.chunk_size)
+        if sub >= left_act.shape[1] and not is_training:
+          act = compute_chunk(left_act, right)
+        else:
+          act = mapping.inference_subbatch(
+              compute_chunk,
+              sub,
+              batched_args=[left_act],
+              nonbatched_args=[right],
+              low_memory=True,
+              input_subbatch_dim=1,
+              output_subbatch_dim=0)
 
       epsilon = 1e-3
       norm = utils.wide_einsum('abc,adc->bdc', mask, mask)
@@ -2394,6 +2419,15 @@ class EmbeddingsAndEvoformer(hk.Module):
 
       # Extra MSA Stack.
       # Jumper et al. (2021) Suppl. Alg. 18 "ExtraMsaStack"
+      num_res = pair_activations.shape[0]
+      pad_res = (-num_res) % 8 if gc.get('use_pallas', False) and not is_training else 0
+      extra_msa_mask = batch['extra_msa_mask'].astype(dtype)
+      if pad_res:
+        extra_msa_activations = jnp.pad(extra_msa_activations, ((0, 0), (0, pad_res), (0, 0)))
+        extra_msa_mask = jnp.pad(extra_msa_mask, ((0, 0), (0, pad_res)))
+        pair_activations = jnp.pad(pair_activations, ((0, pad_res), (0, pad_res), (0, 0)))
+        mask_2d = jnp.pad(mask_2d, ((0, pad_res), (0, pad_res)))
+
       extra_msa_stack_input = {
           'msa': extra_msa_activations,
           'pair': pair_activations,
@@ -2408,7 +2442,7 @@ class EmbeddingsAndEvoformer(hk.Module):
         extra_evoformer_output = extra_msa_stack_iteration(
             activations=act,
             masks={
-                'msa': batch['extra_msa_mask'].astype(dtype),
+                'msa': extra_msa_mask,
                 'pair': mask_2d
             },
             is_training=is_training,
@@ -2481,6 +2515,10 @@ class EmbeddingsAndEvoformer(hk.Module):
         evoformer_masks['msa'] = jnp.concatenate(
             [evoformer_masks['msa'], torsion_angle_mask], axis=0)
 
+      if pad_res:
+        evoformer_input['msa'] = jnp.pad(evoformer_input['msa'], ((0, 0), (0, pad_res), (0, 0)))
+        evoformer_masks['msa'] = jnp.pad(evoformer_masks['msa'], ((0, 0), (0, pad_res)))
+
       # Main trunk of the network
       # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 17-18
       evoformer_iteration = EvoformerIteration(
@@ -2504,8 +2542,8 @@ class EmbeddingsAndEvoformer(hk.Module):
       evoformer_output, safe_key = evoformer_stack(
           (evoformer_input, safe_key))
 
-      msa_activations = evoformer_output['msa']
-      pair_activations = evoformer_output['pair']
+      msa_activations = evoformer_output['msa'][:, :num_res] if pad_res else evoformer_output['msa']
+      pair_activations = evoformer_output['pair'][:num_res, :num_res] if pad_res else evoformer_output['pair']
 
       single_activations = common_modules.Linear(
           c.seq_channel, name='single_activations')(
