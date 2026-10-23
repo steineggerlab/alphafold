@@ -1984,11 +1984,14 @@ class OuterProductMean(hk.Module):
                config,
                global_config,
                num_output_channel,
-               name='outer_product_mean'):
+               name='outer_product_mean',
+               pair_mask=None):
     super().__init__(name=name)
     self.global_config = global_config
     self.config = config
     self.num_output_channel = num_output_channel
+    # a bucketed length's padded pairs: the fused update leaves the residual there
+    self.pair_mask = pair_mask if global_config.get('length_buckets', False) else None
 
   def __call__(self, act, mask, is_training=True, residual=None):
     """Builds OuterProductMean module.
@@ -2082,7 +2085,7 @@ class OuterProductMean(hk.Module):
         if fused is not None:
           # the GEMM, bias, mask norm and residual in one pass: the [b, d*f] product is never written
           norm = utils.wide_einsum('abc,adc->bdc', mask, mask)[..., 0]
-          res = [] if residual is None else [residual]
+          res = [] if residual is None else [residual] + ([] if self.pair_mask is None else [self.pair_mask])
           return fused(lhs, t.reshape(t.shape[0], d, -1), output_b, norm, *res)
         # one GEMM over every row: its intermediate is only the output, so chunks would just shrink the tiles
         act = utils.wide_einsum('bk,kn->bn', lhs, t).reshape(lhs.shape[0], d, -1) + output_b
@@ -2232,7 +2235,8 @@ class EvoformerIteration(hk.Module):
         config=c.outer_product_mean,
         global_config=self.global_config,
         num_output_channel=int(pair_act.shape[-1]),
-        name='outer_product_mean')
+        name='outer_product_mean',
+        pair_mask=pair_mask)
     if c.outer_product_mean.first:
       pair_act = dropout_wrapper_fn(
           outer_module,
