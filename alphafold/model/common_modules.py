@@ -176,10 +176,10 @@ class LayerNorm(hk.LayerNorm):
     self._temp_create_offset = create_offset
 
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-    # Fused Pallas layernorm replaces upcast + layernorm + downcast in one kernel
+    # Fused Pallas layernorm in one kernel, with the upcast and downcast of half inputs
     _last = (self.param_axis is None or tuple(self.param_axis) == (-1,))
     if (_last and self._temp_create_scale and self._temp_create_offset
-        and x.dtype in (jnp.bfloat16, jnp.float16)):
+        and x.dtype in (jnp.bfloat16, jnp.float16, jnp.float32)):
       from colabfold_kernels import fused_ops
       _fused = fused_ops.layer_norm(
           {'use_pallas': _use_pallas, 'compute_capability': _compute_capability,
