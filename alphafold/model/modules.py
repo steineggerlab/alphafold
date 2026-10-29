@@ -2085,6 +2085,23 @@ class OuterProductMean(hk.Module):
         w_b = jnp.broadcast_to(w_flat, (act.shape[0],) + w_flat.shape)
         return utils.wide_einsum('bkd,bkf->bdf', act, w_b) + output_b
 
+    def row_blocks(left_act, right_t, block):
+      # the chunked map's chunks, none past the bucket's live rows (zeros there). Into a fresh buffer: added into the
+      # residual in place, XLA copied the whole pair every block
+      n = left_act.shape[1]
+
+      def add(act, start, size):
+        part = compute_chunk(jax.lax.dynamic_slice_in_dim(left_act, start, size, 1), right_t)
+        return jax.lax.dynamic_update_slice_in_dim(act, part, start, 0)
+
+      dtype = jax.eval_shape(compute_chunk, left_act[:, :block], right_t).dtype
+      act = jnp.zeros((n, n, self.num_output_channel), dtype)
+      full = n // block
+      count = (full if self.pair_mask is None
+               else jnp.minimum(full, -(-_live_length(jnp.any(self.pair_mask > 0, axis=1)) // block)))
+      act = jax.lax.fori_loop(0, count, lambda i, act: add(act, i * block, block), act)
+      return add(act, full * block, n - full * block) if n % block else act
+
     def update(left_act, right_act, mask, residual, reassociate=True):
       outer = None if reassociate else fused_ops.opm_outer(
           gc, _ref.dtype, left_act.shape[0], right_act.shape[-1], right_act.shape[1], self.num_output_channel)
@@ -2111,7 +2128,9 @@ class OuterProductMean(hk.Module):
         # with the fast kernels, chunks only as the intermediate outgrows the transition budget
         sub = (transition_subbatch(gc, (left_act.shape[1], left_act.shape[1], 1), c.num_outer_channel ** 2,
                                    jnp.float32) if gc.get('use_pallas', False) else c.chunk_size)
-        if sub >= left_act.shape[1] and not is_training:
+        if gc.get('use_pallas', False) and not is_training and sub < left_act.shape[1]:
+          act = row_blocks(left_act, right, sub)
+        elif sub >= left_act.shape[1] and not is_training:
           act = compute_chunk(left_act, right)
         else:
           act = mapping.inference_subbatch(
